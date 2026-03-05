@@ -14,39 +14,67 @@ from sklearn import metrics
 import numpy as np
 import glob
 import pickle
+import os
 from components.encoders import MassEncoder, PeakEncoder, PositionalEncoder
 
 threshold=0.9
 def LabelToDict(fp):
     sample = fp.read().strip().split('\n')
     label_dic = dict()
-    for scan in sample:
-        s = scan.strip().split('\t')
-        idx = s[1]
-        qvalue = float(s[2])
-        if s[0] == 'True':
-            label = 1
-            label_dic[idx] = [1, label]
-        else:
-            label = 0
-            label_dic[idx] = [0, label]
+    if len(sample) == 0 or len(sample[0].strip()) == 0:
+        return label_dic
 
-    fp.close()
+    header = sample[0].strip().split('\t')
+    has_header = ("PSMId" in header or "SpecId" in header) and "Label" in header
+    if has_header:
+        idx_col = header.index("PSMId") if "PSMId" in header else header.index("SpecId")
+        label_col = header.index("Label")
+        qvalue_col = header.index("q-value") if "q-value" in header else -1
+        for scan in sample[1:]:
+            s = scan.strip().split('\t')
+            if len(s) <= max(idx_col, label_col):
+                continue
+            idx = s[idx_col]
+            qvalue = float(s[qvalue_col]) if qvalue_col >= 0 and len(s) > qvalue_col else 0.0
+            label = 1 if s[label_col] in ("1", "True", "T", "true") else 0
+            conf = max(0.0, min(1.0, 1.0 - qvalue))
+            label_dic[idx] = [conf if label == 1 else 0, label]
+    else:
+        for scan in sample:
+            s = scan.strip().split('\t')
+            if len(s) < 3:
+                continue
+            idx = s[1]
+            if s[0] == 'True':
+                label = 1
+                label_dic[idx] = [1, label]
+            else:
+                label = 0
+                label_dic[idx] = [0, label]
     return label_dic
 
 
 def pad_control(data,pairmaxlength):
     data = sorted(data, key=lambda x: x[1], reverse=True)
+    width = 2
+    if len(data) > 0:
+        width = max(len(x) for x in data)
+    zero_peak = [0.0] * width
     if len(data) > pairmaxlength:
         data = data[:pairmaxlength]
     else:
         while (len(data) < pairmaxlength):
-            data.append([0, 0])
+            data.append(zero_peak.copy())
+    for i in range(len(data)):
+        if len(data[i]) < width:
+            data[i] = list(data[i]) + [0.0] * (width - len(data[i]))
+        elif len(data[i]) > width:
+            data[i] = list(data[i])[:width]
     data = sorted(data, key=lambda x: x[0])
     return np.asarray(data,dtype=float)
 
 
-def readData(psms, features):
+def readData(psms, features, force_label=None):
     L = []
     Yweight = []
     positive=0
@@ -58,18 +86,27 @@ def readData(psms, features):
         with open(features[i],'rb') as f:
             D_features=pickle.load(f)
 
-        for j in D_Label.keys():
-            if D_Label[j][1]==1:
-                if D_Label[j][0]>threshold:
+        for j, label_item in D_Label.items():
+            if j not in D_features:
+                continue
+            if force_label is None:
+                confidence = label_item[0]
+                label = label_item[1]
+            else:
+                confidence = 1.0 if force_label == 1 else 0.0
+                label = force_label
+
+            if label == 1:
+                if confidence > threshold:
                     L.append(D_features[j])
-                    Y = D_Label[j][1]
+                    Y = 1
                     weight = 1
                     positive+=1
                     Yweight.append([Y, weight])
             else:
                 L.append(D_features[j])
-                Y = D_Label[j][1]
-                weight = D_Label[j][0]
+                Y = 0
+                weight = confidence
                 negative+=1
                 Yweight.append([Y, weight])
 
@@ -77,6 +114,65 @@ def readData(psms, features):
     print(positive)
     print(negative)
     return L, Yweight
+
+
+def pair_psm_and_feature_files(directory):
+    psm_files = sorted(glob.glob(os.path.join(directory, "*.tsv")))
+    feature_files = sorted(glob.glob(os.path.join(directory, "*.pkl")))
+    if len(psm_files) == 0 or len(feature_files) == 0:
+        return [], []
+
+    pkl_by_stem = {
+        os.path.splitext(os.path.basename(pkl))[0]: pkl for pkl in feature_files
+    }
+    matched_psm = []
+    matched_pkl = []
+    used = set()
+    for psm in psm_files:
+        stem = os.path.splitext(os.path.basename(psm))[0]
+        candidates = [
+            stem,
+            stem.replace("_filtered_psms", ""),
+            stem.replace("_psms", ""),
+            stem + "_spectra_feature",
+        ]
+        match = None
+        for cand in candidates:
+            if cand in pkl_by_stem and pkl_by_stem[cand] not in used:
+                match = pkl_by_stem[cand]
+                break
+        if match is None:
+            for pkl_stem, pkl_path in pkl_by_stem.items():
+                if pkl_path in used:
+                    continue
+                if pkl_stem.startswith(stem) or stem.startswith(pkl_stem):
+                    match = pkl_path
+                    break
+        if match is not None:
+            matched_psm.append(psm)
+            matched_pkl.append(match)
+            used.add(match)
+
+    if len(matched_psm) == 0 and len(psm_files) == len(feature_files):
+        return psm_files, feature_files
+    return matched_psm, matched_pkl
+
+
+def split_list(X, Yweight, val_ratio=0.1, test_ratio=0.1, seed=10):
+    n = len(X)
+    idx = np.arange(n)
+    rng = np.random.RandomState(seed)
+    rng.shuffle(idx)
+    test_n = max(1, int(n * test_ratio)) if n >= 10 else max(0, n // 5)
+    val_n = max(1, int(n * val_ratio)) if n - test_n >= 10 else max(0, (n - test_n) // 5)
+    test_idx = idx[:test_n]
+    val_idx = idx[test_n:test_n + val_n]
+    train_idx = idx[test_n + val_n:]
+
+    def _pick(indices):
+        return [X[i] for i in indices], [Yweight[i] for i in indices]
+
+    return _pick(train_idx), _pick(val_idx), _pick(test_idx)
 
 
 class DefineDataset(Data.Dataset):
@@ -358,15 +454,36 @@ if __name__ == "__main__":
             model_name=arg
         elif opt in ("-p"):
             pretrained_model=arg
-    psms = sorted(glob.glob(input_directory+'/*tsv'))
-    features = sorted(glob.glob(input_directory+'/*pkl'))
     start = time.time()
-    #L, Yweight = readData(psms,features)
-    X_train, yweight_train = readData(psms[:9],features[:9])
-    X_test, yweight_test = readData([psms[9]],[features[9]])
-    X_val, yweight_val = readData([psms[10]],[features[10]])
-    #X_train, X_test, yweight_train, yweight_test= train_test_split(L, Yweight, test_size=0.1,random_state=10)
-    #X_train, X_val, yweight_train, yweight_val = train_test_split(X_train, yweight_train, test_size=0.1,random_state=10)
+    pct1_dir = os.path.join(input_directory, "pct1")
+    pct2_dir = os.path.join(input_directory, "pct2")
+
+    if os.path.isdir(pct1_dir) and os.path.isdir(pct2_dir):
+        pct2_psms, pct2_features = pair_psm_and_feature_files(pct2_dir)
+        pct1_psms, pct1_features = pair_psm_and_feature_files(pct1_dir)
+        if len(pct2_psms) == 0 or len(pct1_psms) == 0:
+            raise ValueError("Missing .tsv/.pkl pairs under pct1/pct2 directories.")
+
+        X_pos, y_pos = readData(pct2_psms, pct2_features, force_label=1)
+        X_neg, y_neg = readData(pct1_psms, pct1_features, force_label=0)
+
+        (X_train_pos, y_train_pos), (X_val_pos, y_val_pos), (X_test_pos, y_test_pos) = split_list(X_pos, y_pos)
+        (X_train_neg, y_train_neg), (X_val_neg, y_val_neg), (X_test_neg, y_test_neg) = split_list(X_neg, y_neg)
+
+        X_train = X_train_pos + X_train_neg
+        yweight_train = y_train_pos + y_train_neg
+        X_val = X_val_pos + X_val_neg
+        yweight_val = y_val_pos + y_val_neg
+        X_test = X_test_pos + X_test_neg
+        yweight_test = y_test_pos + y_test_neg
+    else:
+        psms, features = pair_psm_and_feature_files(input_directory)
+        if len(psms) == 0:
+            psms = sorted(glob.glob(input_directory + '/*tsv'))
+            features = sorted(glob.glob(input_directory + '/*pkl'))
+        L, Yweight = readData(psms, features)
+        (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_list(L, Yweight)
+
     end = time.time()
     print('loading data: ' + str(end - start))
     print("length of training data: " + str(len(X_train)))
