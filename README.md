@@ -30,7 +30,7 @@ conda activate WinnowNet
 CUDA version 11.8
 Pytorch GPU version is compatible with corresponding cuda version
 ```bash
-pip install -r ./requirements.txt
+pip install -r ./script/requirements.txt
 ```
 ## Requirements
 * **Operation system**: Linux
@@ -52,10 +52,11 @@ Other raw files benchmark datasets can be downloaded via:
 
 Extract fragment ion matching features along with 11 additional features derived from both theoretical and experimental spectra. The PSM (peptide-spectrum match) candidate information should be provided in a tab-delimited file (e.g., a TSV file output from Percolator).
 ```bash
-python SpectraFeatures.py -i <tsv_file> -s <ms2_file> -o spectra.pkl -t 48 -f cnn
+python script/SpectraFeatures.py -i <tsv_file> -1 <ft1_file> -2 <ft2_file> -o spectra.pkl -t 48 -f cnn
 ```
 * Replace `<tsv_file>` with the path to your PSM candidates file.
-* Replace `<ms2_file>` with the path to your experimental spectra file.
+* Replace `<ft1_file>` with the path to your FT1 file.
+* Replace `<ft2_file>` with the path to your FT2 file.
 * The `-t 48` option sets the number of threads (adjust this value as needed).
 * Use `-f cnn` when preparing input for the CNN-based architecture or `-f att` for the self-attention-based model.
 
@@ -81,13 +82,14 @@ This folder contains scripts, datasets, and instructions for training two varian
 #### Phase 1: Training on Easy Tasks (Synthetic Data)
 
 ```bash
-python SpectraFeatures_training.py -i filename.tsv -s filename.ms2 -o spectra_feature.pkl -t 20 -f att
-python WinnowNet_Att.py -i spectra_feature_directory -m prosit_att.pt
+python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f att
+python script/WinnowNet_Att.py -i spectra_feature_directory -m prosit_att.pt
 ```
 
 **Explanation of options:**
 - `-i`: Input tab-delimited file with PSMs, including labels and weights.
-- `-s`: Corresponding MS2 file (filename should match TSV).
+- `-1`: Corresponding FT1 file.
+- `-2`: Corresponding FT2 file (filename should match TSV).
 - `-o`: Output file to store extracted features as a `pkl` file.
 - `-t`: Number of threads for parallel processing.
 - `-f`: Feature type (`att` for self-attention model).
@@ -97,8 +99,8 @@ python WinnowNet_Att.py -i spectra_feature_directory -m prosit_att.pt
 #### Phase 2: Training on Difficult Tasks (Real Data)
 
 ```bash
-python SpectraFeatures_training.py -i filename.tsv -s filename.ms2 -o spectra_feature.pkl -t 20 -f att
-python WinnowNet_Att.py -i spectra_feature_directory -m marine_att.pt -p prosit_att.pt
+python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f att
+python script/WinnowNet_Att.py -i spectra_feature_directory -m marine_att.pt -p prosit_att.pt
 ```
 
 - `-p`: Pre-trained model from Phase 1.
@@ -113,15 +115,15 @@ python WinnowNet_Att.py -i spectra_feature_directory -m marine_att.pt -p prosit_
 #### Phase 1: Training on Easy Tasks (Synthetic Data)
 
 ```bash
-python SpectraFeatures_training.py -i filename.tsv -s filename.ms2 -o spectra_feature.pkl -t 20 -f cnn
-python WinnowNet_CNN.py -i spectra_feature_directory -m prosit_cnn.pt
+python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f cnn
+python script/WinnowNet_CNN.py -i spectra_feature_directory -m prosit_cnn.pt
 ```
 
 #### Phase 2: Training on Difficult Tasks (Real Data)
 
 ```bash
-python SpectraFeatures_training.py -i filename.tsv -s filename.ms2 -o spectra_feature.pkl -t 20 -f cnn
-python WinnowNet_CNN.py -i spectra_feature_directory -m cnn_pytorch.pt -p prosit_cnn.pt
+python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f cnn
+python script/WinnowNet_CNN.py -i spectra_feature_directory -m cnn_pytorch.pt -p prosit_cnn.pt
 ```
 
 **Pre-trained model:** cnn_pytorch.pt, https://figshare.com/articles/dataset/Models/25513531
@@ -130,7 +132,7 @@ python WinnowNet_CNN.py -i spectra_feature_directory -m cnn_pytorch.pt -p prosit
 
 ### Notes
 
-- All input MS2/TSV files must be preprocessed properly.
+- All input FT1/FT2/TSV files must be preprocessed properly.
 - Models trained in Phase 1 are reused to initialize weights in Phase 2.
 - Training with GPU is recommended for performance.
 
@@ -139,20 +141,21 @@ python WinnowNet_CNN.py -i spectra_feature_directory -m cnn_pytorch.pt -p prosit
 #### Self-Attention-Based WinnowNet
 To generate input representations for PSM candidates and perform re-scoring using the self-attention model, run:
 ```bash
-python SpectraFeatures.py -i tsv_file -s ms2_file -o spectra.pkl -t 48 -f att 
-python Prediction.py -i spectra.pkl -o rescore.out.txt -m att_pytorch.pt  
+python script/SpectraFeatures.py -i tsv_file -1 file.FT1 -2 file.FT2 -o spectra.pkl -t 48 -f att 
+python script/Prediction.py -i spectra.pkl -o rescore.out.txt -m att_pytorch.pt  
 
 ```
 #### CNN-Based WinnowNet
 To generate input representations for PSM candidates and perform re-scoring using the CNN model, run:
 ```bash
-python SpectraFeatures.py -i filename.tsv -s filename.ms2 -o spectra.pkl -t 48 -f cnn
-python Prediction_CNN.py -i spectra.pkl -o rescore.out.txt -m cnn_pytorch.pt 
+python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra.pkl -t 48 -f cnn
+python script/Prediction_CNN.py -i spectra.pkl -o rescore.out.txt -m cnn_pytorch.pt 
 
 ```
 **Explanation of options:**
 - `-i`: Input tab-delimited file with PSMs
-- `-s`: Corresponding MS2 file (filename should match TSV).
+- `-1`: Corresponding FT1 file.
+- `-2`: Corresponding FT2 file (filename should match TSV).
 - `-o`: Output file to store extracted features as a `pkl` file.
 - `-t`: Number of threads for parallel processing.
 - `-f`: Feature type (`att` for self-attention model, `cnn`for CNN model).
@@ -163,7 +166,7 @@ python Prediction_CNN.py -i spectra.pkl -o rescore.out.txt -m cnn_pytorch.pt
 ### FDR Control at the PSM/Peptide Levels
 Filter the re-scored PSM candidates to control the false discovery rate (FDR) at both the PSM and peptide levels (targeted at 1% FDR). You will need both the original PSM file and the re-scoring results.
 ```bash
-python filtering.py -i rescore.out.txt -p tsv_file -o filtered -d Rev_ -f 0.01
+python script/filtering.py -i rescore.out.txt -p tsv_file -o filtered -d Rev_ -f 0.01
 ```
 **Explanation of options:**
 - `-i`: Rescoring file from WinnowNet
@@ -177,7 +180,7 @@ python filtering.py -i rescore.out.txt -p tsv_file -o filtered -d Rev_ -f 0.01
 * Assembling filtered identified peptides into proteins
 * This script is needed to run at the working directory inlucding filtered results at PSM and Peptide levels.
 ```bash
-python sipros_peptide_assembling.py
+python script/sipros_peptides_assembling.py
 ```
 When assembling filtered, identified peptides into proteins, the overall protein-level FDR depends on the quality of the filtered peptide list. An initial peptide-level FDR (for example, 1%) may lead to a protein-level FDR that is higher than desired. In such cases, you need to re-filter the peptides using a stricter (i.e., lower) FDR threshold until you achieve a 1% protein-level FDR. 
 

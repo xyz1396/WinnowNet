@@ -37,6 +37,10 @@ htmlcov/
 *.swo
 *~
 
+# test
+*.pkl
+*.txt
+
 # OS files
 .DS_Store
 Thumbs.db
