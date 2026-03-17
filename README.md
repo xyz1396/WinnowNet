@@ -87,14 +87,14 @@ python script/WinnowNet_Att.py -i spectra_feature_directory -m prosit_att.pt
 ```
 
 **Explanation of options:**
-- `-i`: Input tab-delimited file with PSMs, including labels and weights.
+- `-i`: Directory of `.pkl` feature files. Labels are read from each pickle, which now stores the original TSV/PIN row plus parsed `Label` / `q-value`.
 - `-1`: Corresponding FT1 file.
 - `-2`: Corresponding FT2 file (filename should match TSV).
 - `-o`: Output file to store extracted features as a `pkl` file.
 - `-t`: Number of threads for parallel processing.
 - `-f`: Feature type (`att` for self-attention model).
 - `-m`: Filename to save the trained model.
-- A for-loop is needed to convert all `tsv` files to `pkl` files.
+- Optional split-mode training is also supported with `-target target.pkl[,more.pkl] -decoy decoy.pkl[,more.pkl]`; embedded labels in those pickles are ignored in that mode.
 
 #### Phase 2: Training on Difficult Tasks (Real Data)
 
@@ -142,25 +142,25 @@ python script/WinnowNet_CNN.py -i spectra_feature_directory -m cnn_pytorch.pt -p
 To generate input representations for PSM candidates and perform re-scoring using the self-attention model, run:
 ```bash
 python script/SpectraFeatures.py -i tsv_file -1 file.FT1 -2 file.FT2 -o spectra.pkl -t 48 -f att 
-python script/Prediction.py -i spectra.pkl -o rescore.out.txt -m att_pytorch.pt  
+python script/Prediction.py -i spectra.pkl -o rescore.out.tsv -m att_pytorch.pt  
 
 ```
 #### CNN-Based WinnowNet
 To generate input representations for PSM candidates and perform re-scoring using the CNN model, run:
 ```bash
 python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra.pkl -t 48 -f cnn
-python script/Prediction_CNN.py -i spectra.pkl -o rescore.out.txt -m cnn_pytorch.pt 
+python script/Prediction_CNN.py -i spectra.pkl -o rescore.out.tsv -m cnn_pytorch.pt 
 
 ```
 **Explanation of options:**
-- `-i`: Input tab-delimited file with PSMs
+- `-i`: Input feature pickle produced by `script/SpectraFeatures.py`
 - `-1`: Corresponding FT1 file.
 - `-2`: Corresponding FT2 file (filename should match TSV).
 - `-o`: Output file to store extracted features as a `pkl` file.
 - `-t`: Number of threads for parallel processing.
 - `-f`: Feature type (`att` for self-attention model, `cnn`for CNN model).
 - `-m`: Filename to save the trained model.
-- A for-loop is needed to convert all `tsv` files to `pkl` files.
+- Prediction output is now a rescored TSV containing all original TSV/PIN columns plus updated `score`, `q-value`, and `Label` fields.
 
 ## Evaluation
 ### FDR Control at the PSM/Peptide Levels

@@ -5,10 +5,11 @@ import pickle
 import subprocess
 import sys
 import time
-from multiprocessing import Manager, Pool
+from multiprocessing import get_all_start_methods, get_context
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from pkl_utils import PKL_META_KEY, PKL_SCHEMA_VERSION
 
 pairmaxlength = 500
 diffDa = 0.01
@@ -43,6 +44,15 @@ H = 1.007825
 O = 15.9949
 N_TERMINUS = H
 C_TERMINUS = O + H
+
+_WORKER_EXP_MS1 = None
+_WORKER_EXP_MS2 = None
+_WORKER_THEORY = None
+_WORKER_FEATURE = None
+_WORKER_SCAN_MAP = None
+_WORKER_MODE = "att"
+_WORKER_FRAGMENT_TOP_N = 3
+_WORKER_MS1_WINDOW_MZ = 10.0
 
 class peptide:
 
@@ -146,6 +156,55 @@ def _clean_peptide(peptide_str):
         if len(parts) >= 3:
             return parts[1]
     return peptide_str
+
+
+def _build_field_lookup(fieldnames):
+    lookup = {}
+    for field in fieldnames:
+        if field is None:
+            continue
+        lookup[str(field).strip().lower()] = field
+    return lookup
+
+
+def _resolve_field_name(field_lookup, aliases):
+    for alias in aliases:
+        actual = field_lookup.get(alias.lower())
+        if actual is not None:
+            return actual
+    return None
+
+
+def _get_field_value(row, field_lookup, aliases, default=""):
+    field_name = _resolve_field_name(field_lookup, aliases)
+    if field_name is None:
+        return default
+    return row.get(field_name, default)
+
+
+def _parse_label_value(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if lower in {"1", "+1", "true", "t", "target"}:
+        return 1
+    if lower in {"0", "-1", "false", "f", "decoy"}:
+        return 0
+    return None
+
+
+def _compute_label_confidence(label, qvalue_raw):
+    if label is None:
+        return None
+    if str(qvalue_raw).strip() == "":
+        return 1.0 if label == 1 else 0.0
+    qvalue = max(0.0, min(1.0, _to_float(qvalue_raw, 0.0)))
+    if label == 1:
+        return max(0.0, min(1.0, 1.0 - qvalue))
+    return 0.0
 
 
 def FTtoDict(file_path, reduce_peak_charge_to_one=False):
@@ -293,90 +352,189 @@ def theoryToDict(file_path):
 
 def read_tsv(tsv_file, psm_dict, ms2_dict):
     psm_scan_map = {}
-    with open(tsv_file) as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        use_header = reader.fieldnames is not None and (
-            "PSMId" in reader.fieldnames or "SpecId" in reader.fieldnames
-        )
+    row_records = []
+    record_key_counts = {}
+    row_stats = {
+        "total_rows": 0,
+        "rows_with_psm_id": 0,
+        "target_label_rows": 0,
+        "decoy_label_rows": 0,
+        "unlabeled_rows": 0,
+        "usable_peptide_rows": 0,
+        "skipped_missing_peptide": 0,
+    }
+    with open(tsv_file, newline="") as fh:
+        rows = [row for row in csv.reader(fh, delimiter="\t") if len(row) > 0]
+
+    if len(rows) == 0:
+        table_meta = {
+            "schema_version": PKL_SCHEMA_VERSION,
+            "source_file": os.path.abspath(tsv_file),
+            "source_kind": os.path.splitext(tsv_file)[1].lower().lstrip("."),
+            "has_header": False,
+            "columns": [],
+        }
+        return psm_scan_map, table_meta, row_records, row_stats
+
+    first_row = rows[0]
+    first_row_lookup = {str(value).strip().lower() for value in first_row}
+    use_header = "psmid" in first_row_lookup or "specid" in first_row_lookup
+    if use_header:
+        columns = list(first_row)
+        raw_rows = rows[1:]
+    else:
+        width = max(len(row) for row in rows)
+        columns = [f"col{i + 1}" for i in range(width)]
+        raw_rows = rows
+
+    field_lookup = _build_field_lookup(columns)
+    table_meta = {
+        "schema_version": PKL_SCHEMA_VERSION,
+        "source_file": os.path.abspath(tsv_file),
+        "source_kind": os.path.splitext(tsv_file)[1].lower().lstrip("."),
+        "has_header": use_header,
+        "columns": columns,
+        "id_column": _resolve_field_name(field_lookup, ["PSMId", "SpecId"]),
+        "score_column": _resolve_field_name(field_lookup, ["score"]),
+        "qvalue_column": _resolve_field_name(field_lookup, ["q-value", "qvalue"]),
+        "label_column": _resolve_field_name(field_lookup, ["Label"]),
+    }
+
+    for row_index, raw_values in enumerate(raw_rows):
+        row_stats["total_rows"] += 1
+        values = list(raw_values) + [""] * max(0, len(columns) - len(raw_values))
+        row = {columns[i]: values[i] for i in range(len(columns))}
+
         if use_header:
-            rows = reader
+            idx = (_get_field_value(row, field_lookup, ["PSMId", "SpecId"]) or "").strip()
+            qvalue_raw = _get_field_value(row, field_lookup, ["q-value", "qvalue"], "")
+            peptide_raw = _get_field_value(
+                row,
+                field_lookup,
+                ["Peptide", "peptide", "IdentifiedPeptide", "PeptideSequence"],
+                "",
+            )
+            mass_error_raw = _get_field_value(
+                row,
+                field_lookup,
+                ["massErrors", "massError", "MassError", "Massdiff", "MassDiff"],
+                "0",
+            )
+            isotopic_shift_raw = _get_field_value(
+                row,
+                field_lookup,
+                ["isotopicMassWindowShifts", "isotopicMassWindowShift"],
+                "0",
+            )
+            charge_raw = _get_field_value(
+                row,
+                field_lookup,
+                ["parentCharges", "ParentCharge", "charge", "Charge"],
+                "",
+            )
+            scan_nr_raw = _get_field_value(
+                row,
+                field_lookup,
+                ["ScanNr", "Scan", "scan"],
+                "",
+            )
+            label_raw = _get_field_value(row, field_lookup, ["Label"], "")
         else:
-            fh.seek(0)
-            rows = []
-            for raw in fh:
-                s = raw.strip().split("\t")
-                if len(s) < 2:
-                    continue
-                psm_id = s[0]
-                if len(s) > 1 and ("FT2" in s[1] or "_" in s[1]):
-                    psm_id = s[1]
-                if "FT2" in s[0] and "FT2" not in psm_id:
-                    psm_id = s[0]
-                rows.append(
-                    {
-                        "PSMId": psm_id,
-                        "q-value": s[2] if len(s) > 2 else "0",
-                        "Peptide": s[4] if len(s) > 4 else (s[1] if len(s) > 1 else ""),
-                        "massErrors": "0",
-                        "isotopicMassWindowShifts": "0",
-                        "parentCharges": "",
-                        "ScanNr": "",
-                    }
-                )
+            idx = values[0] if len(values) > 0 else ""
+            if len(values) > 1 and ("FT2" in values[1] or "_" in values[1]):
+                idx = values[1]
+            if len(values) > 0 and "FT2" in values[0] and "FT2" not in idx:
+                idx = values[0]
+            qvalue_raw = values[2] if len(values) > 2 else "0"
+            peptide_raw = values[4] if len(values) > 4 else (values[1] if len(values) > 1 else "")
+            mass_error_raw = "0"
+            isotopic_shift_raw = "0"
+            charge_raw = ""
+            scan_nr_raw = ""
+            label_raw = values[0] if len(values) > 0 else ""
 
-        for row in rows:
-            idx = (row.get("PSMId") or row.get("SpecId") or "").strip()
-            if not idx:
-                continue
-
-            fileidx, scannum = _parse_psm_id(idx)
-            if not scannum:
-                scannum = str(int(_to_float(row.get("ScanNr"), 0)))
-            if not fileidx:
-                fileidx = idx
-
-            charge = str(int(_to_float(row.get("parentCharges"), 0)))
-            if charge == "0":
-                parts = idx.split("_")
-                if len(parts) >= 2 and parts[-2].isdigit():
-                    charge = parts[-2]
-                else:
-                    charge = "2"
-            charge_int = int(_to_float(charge, 0))
-
-            qvalue = _to_float(row.get("q-value"), 0.0)
-            peptidestr = _clean_peptide(row.get("Peptide", ""))
-            if not peptidestr:
-                continue
-
-            pep = peptide()
-            pep.PSMId = idx
-            pep.qvalue = qvalue
-            pep.identified_pep = peptidestr
-            pep.num_missed_cleavages = peptidestr[:-1].count("K") + peptidestr[:-1].count("R")
-            pep.mono_mass = sum([AA_dict[aa] for aa in peptidestr]) + N_TERMINUS + C_TERMINUS
-            pep.theory_mass = pep.mono_mass
-            pep.mass_error = _to_float(row.get("massErrors"), 0.0)
-            pep.isotopic_mass_window_shift = _to_float(row.get("isotopicMassWindowShifts"), 0.0)
-            pep.peplen = len(peptidestr)
-
-            uniqueID = f"{fileidx}.{scannum}.{charge}"
-            if uniqueID in psm_dict:
-                psm_dict[uniqueID].add_pep(pep)
-            else:
-                one_scan = scan()
-                one_scan.fidx = fileidx
-                one_scan.scan_number = scannum
-                one_scan.charge = charge
-                one_scan.add_pep(pep)
-                one_scan.ms1_scan = ms2_dict.get(scannum, {}).get("parent_scan", "")
-                psm_dict[uniqueID] = one_scan
-            psm_scan_map[idx] = {
-                "ms2_scan": scannum,
-                "ms1_scan": psm_dict[uniqueID].ms1_scan,
-                "charge": charge_int,
+        idx = idx.strip()
+        label = _parse_label_value(label_raw)
+        label_confidence = _compute_label_confidence(label, qvalue_raw)
+        if idx:
+            row_stats["rows_with_psm_id"] += 1
+        if label == 1:
+            row_stats["target_label_rows"] += 1
+        elif label == 0:
+            row_stats["decoy_label_rows"] += 1
+        else:
+            row_stats["unlabeled_rows"] += 1
+        record_key = idx or f"__row_{row_index}"
+        if record_key in record_key_counts:
+            record_key_counts[record_key] += 1
+            record_key = f"{record_key}__dup{record_key_counts[record_key]}"
+        else:
+            record_key_counts[record_key] = 0
+        row_records.append(
+            {
+                "record_key": record_key,
+                "psm_id": idx,
+                "row_index": row_index,
+                "row_values": values,
+                "label": label,
+                "label_raw": label_raw,
+                "label_confidence": label_confidence,
             }
-    return psm_scan_map
+        )
+
+        if not idx:
+            continue
+
+        fileidx, scannum = _parse_psm_id(idx)
+        if not scannum:
+            scannum = str(int(_to_float(scan_nr_raw, 0)))
+        if not fileidx:
+            fileidx = idx
+
+        charge = str(int(_to_float(charge_raw, 0)))
+        if charge == "0":
+            parts = idx.split("_")
+            if len(parts) >= 2 and parts[-2].isdigit():
+                charge = parts[-2]
+            else:
+                charge = "2"
+        charge_int = int(_to_float(charge, 0))
+
+        qvalue = _to_float(qvalue_raw, 0.0)
+        peptidestr = _clean_peptide(peptide_raw)
+        if not peptidestr:
+            row_stats["skipped_missing_peptide"] += 1
+            continue
+        row_stats["usable_peptide_rows"] += 1
+
+        pep = peptide()
+        pep.PSMId = idx
+        pep.qvalue = qvalue
+        pep.identified_pep = peptidestr
+        pep.num_missed_cleavages = peptidestr[:-1].count("K") + peptidestr[:-1].count("R")
+        pep.mono_mass = sum([AA_dict[aa] for aa in peptidestr]) + N_TERMINUS + C_TERMINUS
+        pep.theory_mass = pep.mono_mass
+        pep.mass_error = _to_float(mass_error_raw, 0.0)
+        pep.isotopic_mass_window_shift = _to_float(isotopic_shift_raw, 0.0)
+        pep.peplen = len(peptidestr)
+
+        uniqueID = f"{fileidx}.{scannum}.{charge}"
+        if uniqueID in psm_dict:
+            psm_dict[uniqueID].add_pep(pep)
+        else:
+            one_scan = scan()
+            one_scan.fidx = fileidx
+            one_scan.scan_number = scannum
+            one_scan.charge = charge
+            one_scan.add_pep(pep)
+            one_scan.ms1_scan = ms2_dict.get(scannum, {}).get("parent_scan", "")
+            psm_dict[uniqueID] = one_scan
+        psm_scan_map[idx] = {
+            "ms2_scan": scannum,
+            "ms1_scan": psm_dict[uniqueID].ms1_scan,
+            "charge": charge_int,
+        }
+    return psm_scan_map, table_meta, row_records, row_stats
 
 def feature_dict(f_dict):
     D_feature = dict()
@@ -476,8 +634,6 @@ def IonExtract(
     ms2_peaks,
     Xtheory,
     X_add_feature,
-    key,
-    return_dict,
     fragment_top_n=3,
 ):
     ms1_array = _to_peak_array(ms1_peaks)
@@ -502,7 +658,7 @@ def IonExtract(
     xFeatures[:, 1] = Norm[:, 1]
     xFeatures[:, 2] = Norm[:, 2]
     xFeatures = xFeatures.transpose()
-    return_dict[key] = [xFeatures, X_add_feature]
+    return [xFeatures, X_add_feature]
 
 
 def IonExtract_Att(
@@ -510,8 +666,6 @@ def IonExtract_Att(
     ms2_peaks,
     Xtheory,
     X_add_feature,
-    key,
-    return_dict,
     isolation_window_mz=10.0,
 ):
     ms1_filtered = _filter_ms1_window(
@@ -535,7 +689,76 @@ def IonExtract_Att(
     Xexp[:, 1] = Norm[:, 1]
     Norm = transformer.fit_transform(Xtheory)
     Xtheory[:, 1] = Norm[:, 1]
-    return_dict[key] = [Xexp, Xtheory]
+    return [Xexp, Xtheory]
+
+
+def _set_worker_state(
+    exp_ms1,
+    exp_ms2,
+    theory,
+    feature,
+    scan_map,
+    mode,
+    fragment_top_n,
+    ms1_window_mz,
+):
+    global _WORKER_EXP_MS1
+    global _WORKER_EXP_MS2
+    global _WORKER_THEORY
+    global _WORKER_FEATURE
+    global _WORKER_SCAN_MAP
+    global _WORKER_MODE
+    global _WORKER_FRAGMENT_TOP_N
+    global _WORKER_MS1_WINDOW_MZ
+
+    _WORKER_EXP_MS1 = exp_ms1
+    _WORKER_EXP_MS2 = exp_ms2
+    _WORKER_THEORY = theory
+    _WORKER_FEATURE = feature
+    _WORKER_SCAN_MAP = scan_map
+    _WORKER_MODE = mode
+    _WORKER_FRAGMENT_TOP_N = fragment_top_n
+    _WORKER_MS1_WINDOW_MZ = ms1_window_mz
+
+
+def _extract_feature_for_key(key):
+    scan_info = _WORKER_SCAN_MAP.get(key)
+    if scan_info is None:
+        return key, None
+
+    ms2_scan = scan_info["ms2_scan"]
+    ms1_scan = scan_info["ms1_scan"]
+    ms2_peaks = _WORKER_EXP_MS2.get(ms2_scan, {}).get("peaks", [])
+    ms1_peaks = _WORKER_EXP_MS1.get(ms1_scan, {}).get("peaks", [])
+    theory = _WORKER_THEORY.get(key)
+    features = _WORKER_FEATURE.get(key)
+
+    if theory is None or features is None:
+        return key, None
+
+    if _WORKER_MODE == "cnn":
+        model_input = IonExtract(
+            ms1_peaks,
+            ms2_peaks,
+            theory,
+            features,
+            _WORKER_FRAGMENT_TOP_N,
+        )
+    else:
+        model_input = IonExtract_Att(
+            ms1_peaks,
+            ms2_peaks,
+            theory,
+            features,
+            _WORKER_MS1_WINDOW_MZ,
+        )
+    return key, model_input
+
+
+def _iter_feature_keys(theory_dict, feature_dict_map, scan_map):
+    for key in theory_dict:
+        if key in feature_dict_map and key in scan_map:
+            yield key
 
 
 def print_usage():
@@ -630,7 +853,17 @@ def main(argv=None):
     print('Experimental spectra loaded (FT1 + FT2)!')
 
     psm_dict = dict()
-    psm_scan_map = read_tsv(tsv_file, psm_dict, D_exp_ms2)
+    psm_scan_map, table_meta, row_records, row_stats = read_tsv(tsv_file, psm_dict, D_exp_ms2)
+    print(
+        "Input rows: "
+        f"total={row_stats['total_rows']} "
+        f"with_psm_id={row_stats['rows_with_psm_id']} "
+        f"target_label=1:{row_stats['target_label_rows']} "
+        f"decoy_label=-1:{row_stats['decoy_label_rows']} "
+        f"unlabeled={row_stats['unlabeled_rows']} "
+        f"usable_peptide={row_stats['usable_peptide_rows']} "
+        f"skipped_missing_peptide={row_stats['skipped_missing_peptide']}"
+    )
 
     cmd = [
         theoretical_bin,
@@ -652,61 +885,88 @@ def main(argv=None):
     D_feature = feature_dict(psm_dict)
     print('Additional features loaded!')
 
-    manager = Manager()
-    return_dict = manager.dict()
-    pool = Pool(processes=int(num_cpus))
-    if mode == 'cnn':
-        for key in D_theory:
-            if key not in D_feature or key not in psm_scan_map:
-                continue
-            ms2_scan = psm_scan_map[key]["ms2_scan"]
-            ms1_scan = psm_scan_map[key]["ms1_scan"]
-            ms2_peaks = D_exp_ms2.get(ms2_scan, {}).get("peaks", [])
-            ms1_peaks = D_exp_ms1.get(ms1_scan, {}).get("peaks", [])
-            pool.apply_async(
-                IonExtract,
-                args=(
-                    ms1_peaks,
-                    ms2_peaks,
-                    D_theory[key],
-                    D_feature[key],
-                    key,
-                    return_dict,
-                    fragment_env_top_n,
-                ),
-            )
+    worker_count = max(1, int(_to_float(num_cpus, 1)))
+    feature_payload = {}
+    feature_keys = _iter_feature_keys(D_theory, D_feature, psm_scan_map)
+    _set_worker_state(
+        D_exp_ms1,
+        D_exp_ms2,
+        D_theory,
+        D_feature,
+        psm_scan_map,
+        mode,
+        fragment_env_top_n,
+        ms1_isolation_window_mz,
+    )
+
+    if worker_count == 1:
+        for key in feature_keys:
+            feature_key, model_input = _extract_feature_for_key(key)
+            if model_input is not None:
+                feature_payload[feature_key] = model_input
     else:
-        for key in D_theory:
-            if key not in D_feature or key not in psm_scan_map:
-                continue
-            ms2_scan = psm_scan_map[key]["ms2_scan"]
-            ms1_scan = psm_scan_map[key]["ms1_scan"]
-            ms2_peaks = D_exp_ms2.get(ms2_scan, {}).get("peaks", [])
-            ms1_peaks = D_exp_ms1.get(ms1_scan, {}).get("peaks", [])
-            pool.apply_async(
-                IonExtract_Att,
-                args=(
-                    ms1_peaks,
-                    ms2_peaks,
-                    D_theory[key],
-                    D_feature[key],
-                    key,
-                    return_dict,
-                    ms1_isolation_window_mz,
-                ),
+        start_method = "fork" if "fork" in get_all_start_methods() else None
+        ctx = get_context(start_method) if start_method else get_context()
+        pool_kwargs = {"processes": worker_count}
+        if ctx.get_start_method() != "fork":
+            pool_kwargs["initializer"] = _set_worker_state
+            pool_kwargs["initargs"] = (
+                D_exp_ms1,
+                D_exp_ms2,
+                D_theory,
+                D_feature,
+                psm_scan_map,
+                mode,
+                fragment_env_top_n,
+                ms1_isolation_window_mz,
             )
-    pool.close()
-    pool.join()
+        with ctx.Pool(**pool_kwargs) as pool:
+            for feature_key, model_input in pool.imap_unordered(
+                _extract_feature_for_key,
+                feature_keys,
+                chunksize=8,
+            ):
+                if model_input is not None:
+                    feature_payload[feature_key] = model_input
 
     print('Features generated!')
     if os.path.exists(theoretical_file):
         os.remove(theoretical_file)
 
-    return_dict = dict(return_dict)
-    if mode != "cnn":
-        return_dict = {k: return_dict[k] for k in D_feature.keys() if k in return_dict}
+    rows_with_model_input = 0
+    rows_without_model_input = 0
+    final_payload = {
+        PKL_META_KEY: {
+            **table_meta,
+            "mode": mode,
+        }
+    }
+    for row_record in row_records:
+        psm_id = row_record["psm_id"]
+        model_input = feature_payload.get(psm_id) if psm_id else None
+        if model_input is None:
+            rows_without_model_input += 1
+        else:
+            rows_with_model_input += 1
+        final_payload[row_record["record_key"]] = {
+            "psm_id": psm_id,
+            "model_input": model_input,
+            "label": row_record["label"],
+            "label_raw": row_record["label_raw"],
+            "label_confidence": row_record["label_confidence"],
+            "row_index": row_record["row_index"],
+            "row_values": row_record["row_values"],
+        }
+    print(
+        "PKL rows: "
+        f"total={len(row_records)} "
+        f"with_model_input={rows_with_model_input} "
+        f"without_model_input={rows_without_model_input} "
+        f"feature_keys={len(feature_payload)} "
+        f"mode={mode}"
+    )
     with open(output_file, 'wb') as f:
-        pickle.dump(return_dict, f)
+        pickle.dump(final_payload, f)
     print('time:' + str(time.time() - start_time))
     return 0
 

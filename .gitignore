@@ -38,6 +38,7 @@ htmlcov/
 *~
 
 # test
+*.pt
 *.pkl
 *.txt
 
@@ -47,3 +48,4 @@ Thumbs.db
 
 # Model artifacts
 model/
+att_checkpoints/

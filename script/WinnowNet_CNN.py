@@ -14,125 +14,90 @@ import pickle
 import sys
 import getopt
 import os
+from pkl_utils import (
+    expand_pickle_inputs,
+    get_entry_label,
+    get_entry_label_confidence,
+    get_entry_model_input,
+    load_feature_pickle,
+    normalize_long_flag_aliases,
+)
 
 threshold=0.9
-def LabelToDict(fp):
-    sample = fp.read().strip().split('\n')
-    label_dic = dict()
-    if len(sample) == 0 or len(sample[0].strip()) == 0:
-        return label_dic
-
-    header = sample[0].strip().split('\t')
-    has_header = ("PSMId" in header or "SpecId" in header) and "Label" in header
-    if has_header:
-        idx_col = header.index("PSMId") if "PSMId" in header else header.index("SpecId")
-        label_col = header.index("Label")
-        qvalue_col = header.index("q-value") if "q-value" in header else -1
-        for scan in sample[1:]:
-            s = scan.strip().split('\t')
-            if len(s) <= max(idx_col, label_col):
-                continue
-            idx = s[idx_col]
-            qvalue = float(s[qvalue_col]) if qvalue_col >= 0 and len(s) > qvalue_col else 0.0
-            label = 1 if s[label_col] in ("1", "True", "T", "true") else 0
-            conf = max(0.0, min(1.0, 1.0 - qvalue))
-            if label == 1:
-                label_dic[idx] = [conf, label]
-            else:
-                label_dic[idx] = [0, label]
-    else:
-        for scan in sample:
-            s = scan.strip().split('\t')
-            if len(s) < 3:
-                continue
-            idx = s[1]
-            qvalue = float(s[2])
-            if s[0] == 'True':
-                label = 1
-                label_dic[idx] = [1 - qvalue, label]
-            else:
-                label = 0
-                label_dic[idx] = [(1-qvalue)/2, label]
-    return label_dic
+def _label_matches_expected(entry):
+    label = get_entry_label(entry)
+    if label is None:
+        return True
+    return label == 1
 
 
-def readData(psms, features, force_label=None):
+def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset"):
     L = []
     Yweight = []
+    total_rows = 0
+    kept_rows = 0
+    skipped_non_one = 0
+    unlabeled_rows = 0
 
-    for i in range(len(psms)):
-        with open(psms[i]) as f:
-            D_Label=LabelToDict(f)
-        with open(features[i],'rb') as f:
-            D_features=pickle.load(f)
-
-        for j, label_item in D_Label.items():
-            if j not in D_features:
+    for feature_path in feature_paths:
+        _, entries = load_feature_pickle(feature_path)
+        for _, entry in entries.items():
+            total_rows += 1
+            model_input = get_entry_model_input(entry)
+            if model_input is None:
                 continue
+
             if force_label is None:
-                confidence = label_item[0]
-                label = label_item[1]
+                label = get_entry_label(entry)
+                confidence = get_entry_label_confidence(entry)
+                if label is None:
+                    continue
+                if confidence is None:
+                    confidence = 1.0 if label == 1 else 0.0
             else:
-                confidence = 1.0 if force_label == 1 else 0.0
+                if get_entry_label(entry) is None:
+                    unlabeled_rows += 1
+                elif not _label_matches_expected(entry):
+                    skipped_non_one += 1
+                    continue
                 label = force_label
+                confidence = 1.0 if force_label == 1 else 0.0
 
             if label == 1:
                 if confidence > threshold:
-                    L.append(D_features[j][0])
-                    Y = 1
-                    weight = 1
-                    Yweight.append([Y, weight])
+                    L.append(model_input[0])
+                    Yweight.append([1, 1])
+                    kept_rows += 1
             else:
-                L.append(D_features[j][0])
-                Y = 0
-                weight = confidence
-                Yweight.append([Y, weight])
+                L.append(model_input[0])
+                Yweight.append([0, confidence])
+                kept_rows += 1
 
-        del D_features
-
+    print(
+        f"[{dataset_name}] total_rows={total_rows} kept_rows={kept_rows} "
+        f"unlabeled_rows={unlabeled_rows} skipped_label_not_1={skipped_non_one}"
+    )
     return L, Yweight
 
 
-def pair_psm_and_feature_files(directory):
-    psm_files = sorted(glob.glob(os.path.join(directory, "*.tsv")))
-    feature_files = sorted(glob.glob(os.path.join(directory, "*.pkl")))
-    if len(psm_files) == 0 or len(feature_files) == 0:
-        return [], []
+def _collect_pickles_from_directory(directory):
+    return sorted(glob.glob(os.path.join(directory, "*.pkl")))
 
-    pkl_by_stem = {
-        os.path.splitext(os.path.basename(pkl))[0]: pkl for pkl in feature_files
-    }
-    matched_psm = []
-    matched_pkl = []
-    used = set()
-    for psm in psm_files:
-        stem = os.path.splitext(os.path.basename(psm))[0]
-        candidates = [
-            stem,
-            stem.replace("_filtered_psms", ""),
-            stem.replace("_psms", ""),
-            stem + "_spectra_feature",
-        ]
-        match = None
-        for cand in candidates:
-            if cand in pkl_by_stem and pkl_by_stem[cand] not in used:
-                match = pkl_by_stem[cand]
-                break
-        if match is None:
-            for pkl_stem, pkl_path in pkl_by_stem.items():
-                if pkl_path in used:
-                    continue
-                if pkl_stem.startswith(stem) or stem.startswith(pkl_stem):
-                    match = pkl_path
-                    break
-        if match is not None:
-            matched_psm.append(psm)
-            matched_pkl.append(match)
-            used.add(match)
 
-    if len(matched_psm) == 0 and len(psm_files) == len(feature_files):
-        return psm_files, feature_files
-    return matched_psm, matched_pkl
+def _resolve_training_inputs(input_directory, explicit_target, explicit_decoy):
+    target_pickles = expand_pickle_inputs(explicit_target)
+    decoy_pickles = expand_pickle_inputs(explicit_decoy)
+    if target_pickles or decoy_pickles:
+        if not target_pickles or not decoy_pickles:
+            raise ValueError("Both -target and -decoy must be provided together.")
+        return target_pickles, decoy_pickles, True
+
+    pct1_dir = os.path.join(input_directory, "pct1")
+    pct2_dir = os.path.join(input_directory, "pct2")
+    if os.path.isdir(pct1_dir) and os.path.isdir(pct2_dir):
+        return _collect_pickles_from_directory(pct2_dir), _collect_pickles_from_directory(pct1_dir), True
+
+    return _collect_pickles_from_directory(input_directory), [], False
 
 
 def split_list(X, Yweight, val_ratio=0.1, test_ratio=0.1, seed=10):
@@ -437,28 +402,40 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
 
 
 if __name__ == "__main__":
-    argv=sys.argv[1:]
+    argv = normalize_long_flag_aliases(
+        sys.argv[1:],
+        {
+            "-target": "--target",
+            "-decoy": "--decoy",
+        },
+    )
     try:
-        opts, args = getopt.getopt(argv, "hi:m:p:t:")
+        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy="])
     except:
         print("Error Option, using -h for help information.")
         sys.exit(1)
     if len(opts)==0:
         print("\n\nUsage:\n")
-        print("-i\t Directories for spectra features and Label\n")
-        print("-m\t Pre-trained model name\n")
-        print("-p\t Output trained model name\n")
+        print("-i\t Directory containing feature pickles with embedded labels\n")
+        print("-m\t Output trained model name\n")
+        print("-p\t Optional pretrained model name\n")
+        print("-target\t Target feature pickle(s), comma-separated or repeated\n")
+        print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
         sys.exit(1)
         start_time=time.time()
     input_directory=""
     model_name=""
     pretrained_model=""
+    target_inputs = []
+    decoy_inputs = []
     for opt, arg in opts:
         if opt in ("-h"):
             print("\n\nUsage:\n")
-            print("-i\t Directories for spectra features\n")
-            print("-m\t ms2 format spectrum information\n")
-            print("-p\t Output trained model name\n")
+            print("-i\t Directory containing feature pickles with embedded labels\n")
+            print("-m\t Output trained model name\n")
+            print("-p\t Optional pretrained model name\n")
+            print("-target\t Target feature pickle(s), comma-separated or repeated\n")
+            print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
             sys.exit(1)
         elif opt in ("-i"):
             input_directory=arg
@@ -466,19 +443,26 @@ if __name__ == "__main__":
             model_name=arg
         elif opt in ("-p"):
             pretrained_model=arg
+        elif opt == "--target":
+            target_inputs.append(arg)
+        elif opt == "--decoy":
+            decoy_inputs.append(arg)
     start = time.time()
-    pct1_dir = os.path.join(input_directory, "pct1")
-    pct2_dir = os.path.join(input_directory, "pct2")
+    split_mode = bool(target_inputs or decoy_inputs)
+    if not split_mode and len(input_directory) == 0:
+        raise ValueError("Use -i for embedded-label training or provide both -target and -decoy.")
 
-    if os.path.isdir(pct1_dir) and os.path.isdir(pct2_dir):
-        pct2_psms, pct2_features = pair_psm_and_feature_files(pct2_dir)
-        pct1_psms, pct1_features = pair_psm_and_feature_files(pct1_dir)
-        if len(pct2_psms) == 0 or len(pct1_psms) == 0:
-            raise ValueError("Missing .tsv/.pkl pairs under pct1/pct2 directories.")
+    target_pickles, decoy_pickles, split_mode = _resolve_training_inputs(
+        input_directory,
+        target_inputs,
+        decoy_inputs,
+    )
 
-        X_pos, y_pos = readData(pct2_psms, pct2_features, force_label=1)
-        X_neg, y_neg = readData(pct1_psms, pct1_features, force_label=0)
-
+    if split_mode:
+        if len(target_pickles) == 0 or len(decoy_pickles) == 0:
+            raise ValueError("Missing target/decoy pickle inputs.")
+        X_pos, y_pos = _load_feature_records(target_pickles, force_label=1, dataset_name="target")
+        X_neg, y_neg = _load_feature_records(decoy_pickles, force_label=0, dataset_name="decoy")
         (X_train_pos, y_train_pos), (X_val_pos, y_val_pos), (X_test_pos, y_test_pos) = split_list(X_pos, y_pos)
         (X_train_neg, y_train_neg), (X_val_neg, y_val_neg), (X_test_neg, y_test_neg) = split_list(X_neg, y_neg)
 
@@ -489,11 +473,9 @@ if __name__ == "__main__":
         X_test = X_test_pos + X_test_neg
         yweight_test = y_test_pos + y_test_neg
     else:
-        psms, features = pair_psm_and_feature_files(input_directory)
-        if len(psms) == 0:
-            psms = sorted(glob.glob(input_directory+'/*tsv'))
-            features = sorted(glob.glob(input_directory+'/*pkl'))
-        L, Yweight = readData(psms,features)
+        if len(target_pickles) == 0:
+            raise ValueError(f"No feature pickles found under {input_directory}.")
+        L, Yweight = _load_feature_records(target_pickles, dataset_name="embedded")
         (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_list(L, Yweight)
 
     end = time.time()
