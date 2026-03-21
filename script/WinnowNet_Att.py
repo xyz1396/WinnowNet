@@ -28,6 +28,7 @@ from pkl_utils import (
 threshold=0.9
 DEFAULT_TRAIN_BATCH_SIZE = 64
 DEFAULT_EVAL_BATCH_SIZE = 128
+DEFAULT_MAX_PEAKS = 300
 
 
 def _label_matches_expected(entry):
@@ -176,16 +177,17 @@ def split_list(X, Yweight, val_ratio=0.1, test_ratio=0.1, seed=10):
 
 
 class DefineDataset(Data.Dataset):
-    def __init__(self, X, yweight):
+    def __init__(self, X, yweight, max_peaks=DEFAULT_MAX_PEAKS):
         self.X = X
         self.yweight = yweight
+        self.max_peaks = max_peaks
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        xspectra1 = pad_control(self.X[idx][0],200)
-        xspectra2 = pad_control(self.X[idx][1],200)
+        xspectra1 = pad_control(self.X[idx][0], self.max_peaks)
+        xspectra2 = pad_control(self.X[idx][1], self.max_peaks)
         y = self.yweight[idx][0]
         weight = self.yweight[idx][1]
         xspectra1 = torch.FloatTensor(xspectra1)
@@ -389,19 +391,21 @@ def train_model(
     pretrained_model,
     train_batch_size,
     eval_batch_size,
+    max_peaks,
 ):
     LR = 1e-4
-    train_data = DefineDataset(X_train, yweight_train)
-    val_data = DefineDataset(X_val, yweight_val)
-    test_data = DefineDataset(X_test, yweight_test)
+    train_data = DefineDataset(X_train, yweight_train, max_peaks=max_peaks)
+    val_data = DefineDataset(X_val, yweight_val, max_peaks=max_peaks)
+    test_data = DefineDataset(X_test, yweight_test, max_peaks=max_peaks)
     model_output_path, checkpoint_dir = _prepare_output_paths(model_name)
     checkpoint_paths = []
     print("Model output path: " + model_output_path)
     print("Checkpoint directory: " + checkpoint_dir)
     print("Train batch size: " + str(train_batch_size))
     print("Eval batch size: " + str(eval_batch_size))
+    print("Max peaks kept per spectrum: " + str(max_peaks))
     device = torch.device("cuda")
-    model = DualPeakClassifier(dim_model=256,n_heads=4,dim_feedforward=512,n_layers=4,dim_intensity=None,num_classes=2,dropout=0.3,max_len=200)
+    model = DualPeakClassifier(dim_model=256,n_heads=4,dim_feedforward=512,n_layers=4,dim_intensity=None,num_classes=2,dropout=0.3,max_len=max_peaks)
     model.cuda()
     model = nn.DataParallel(model)
     model.to(device)
@@ -468,13 +472,14 @@ if __name__ == "__main__":
             "-decoy": "--decoy",
             "-train-batch-size": "--train-batch-size",
             "-eval-batch-size": "--eval-batch-size",
+            "-max-peaks": "--max-peaks",
         },
     )
     try:
         opts, args = getopt.getopt(
             argv,
             "hi:m:p:",
-            ["target=", "decoy=", "train-batch-size=", "eval-batch-size="],
+            ["target=", "decoy=", "train-batch-size=", "eval-batch-size=", "max-peaks="],
         )
     except:
         print("Error Option, using -h for help information.")
@@ -484,10 +489,11 @@ if __name__ == "__main__":
         print("-i\t Directory containing feature pickles with embedded labels\n")
         print("-m\t Output trained model name\n")
         print("-p\t Optional pretrained model name\n")
-        print("-target\t Target feature pickle(s), comma-separated or repeated\n")
-        print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
+        print("-target\t Target feature pickle(s) or directory, comma-separated or repeated\n")
+        print("-decoy\t Decoy feature pickle(s) or directory, comma-separated or repeated\n")
         print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
         print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
+        print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
         sys.exit(1)
         start_time=time.time()
     input_directory=""
@@ -495,6 +501,7 @@ if __name__ == "__main__":
     pretrained_model=""
     train_batch_size = DEFAULT_TRAIN_BATCH_SIZE
     eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
+    max_peaks = DEFAULT_MAX_PEAKS
     target_inputs = []
     decoy_inputs = []
     for opt, arg in opts:
@@ -503,10 +510,11 @@ if __name__ == "__main__":
             print("-i\t Directory containing feature pickles with embedded labels\n")
             print("-m\t Output trained model name\n")
             print("-p\t Optional pretrained model name\n")
-            print("-target\t Target feature pickle(s), comma-separated or repeated\n")
-            print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
+            print("-target\t Target feature pickle(s) or directory, comma-separated or repeated\n")
+            print("-decoy\t Decoy feature pickle(s) or directory, comma-separated or repeated\n")
             print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
             print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
+            print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
             sys.exit(1)
         elif opt in ("-i"):
             input_directory=arg
@@ -522,6 +530,8 @@ if __name__ == "__main__":
             train_batch_size = _parse_positive_int(arg, "--train-batch-size")
         elif opt == "--eval-batch-size":
             eval_batch_size = _parse_positive_int(arg, "--eval-batch-size")
+        elif opt == "--max-peaks":
+            max_peaks = _parse_positive_int(arg, "--max-peaks")
     start = time.time()
     split_mode = bool(target_inputs or decoy_inputs)
     if not split_mode and len(input_directory) == 0:
@@ -569,5 +579,6 @@ if __name__ == "__main__":
         pretrained_model,
         train_batch_size,
         eval_batch_size,
+        max_peaks,
     )
     print('done')

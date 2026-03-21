@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.utils.data as Data
 from torch.autograd import Variable
 
-from WinnowNet_Att import DualPeakClassifier, pad_control
+from WinnowNet_Att import DEFAULT_MAX_PEAKS, DualPeakClassifier, pad_control
 from pkl_utils import (
     choose_output_column,
     format_label_value,
@@ -18,19 +18,21 @@ from pkl_utils import (
     get_entry_row_index,
     get_entry_row_map,
     load_feature_pickle,
+    normalize_long_flag_aliases,
 )
 
 
 class DefineDataset(Data.Dataset):
-    def __init__(self, X):
+    def __init__(self, X, max_peaks=DEFAULT_MAX_PEAKS):
         self.X = X
+        self.max_peaks = max_peaks
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        xspectra1 = pad_control(self.X[idx][0], 200)
-        xspectra2 = pad_control(self.X[idx][1], 200)
+        xspectra1 = pad_control(self.X[idx][0], self.max_peaks)
+        xspectra2 = pad_control(self.X[idx][1], self.max_peaks)
         xspectra1 = torch.FloatTensor(xspectra1)
         xspectra2 = torch.FloatTensor(xspectra2)
         return xspectra1, xspectra2
@@ -72,8 +74,18 @@ def _compute_qvalues(scores, labels):
     return qvalues
 
 
-def _predict_scores(model, model_name, feature_batches, device):
-    test_data = DefineDataset(feature_batches)
+def _parse_positive_int(value, flag_name):
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError(f"{flag_name} must be an integer.")
+    if parsed <= 0:
+        raise ValueError(f"{flag_name} must be greater than 0.")
+    return parsed
+
+
+def _predict_scores(model, model_name, feature_batches, device, max_peaks):
+    test_data = DefineDataset(feature_batches, max_peaks=max_peaks)
     test_loader = Data.DataLoader(test_data, batch_size=32)
     model.load_state_dict(
         torch.load(model_name, map_location=lambda storage, loc: storage)
@@ -147,9 +159,14 @@ def _write_rescored_output(output_file, meta, ordered_items, score_map):
 
 
 if __name__ == "__main__":
-    argv = sys.argv[1:]
+    argv = normalize_long_flag_aliases(
+        sys.argv[1:],
+        {
+            "-max-peaks": "--max-peaks",
+        },
+    )
     try:
-        opts, args = getopt.getopt(argv, "hi:m:o:")
+        opts, args = getopt.getopt(argv, "hi:m:o:", ["max-peaks="])
     except Exception:
         print("Error Option, using -h for help information.")
         sys.exit(1)
@@ -158,17 +175,20 @@ if __name__ == "__main__":
         print("-i\t input representation file name\n")
         print("-m\t Pre-trained model name\n")
         print("-o\t Output rescored TSV file\n")
+        print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
         sys.exit(1)
 
     input_file = ""
     model_name = ""
     output_file = ""
+    max_peaks = DEFAULT_MAX_PEAKS
     for opt, arg in opts:
         if opt in ("-h"):
             print("\n\nUsage:\n")
             print("-i\t input representation file name\n")
             print("-m\t Pre-trained model name\n")
             print("-o\t Output rescored TSV file\n")
+            print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
             sys.exit(1)
         elif opt in ("-i"):
             input_file = arg
@@ -176,6 +196,8 @@ if __name__ == "__main__":
             model_name = arg
         elif opt in ("-o"):
             output_file = arg
+        elif opt == "--max-peaks":
+            max_peaks = _parse_positive_int(arg, "--max-peaks")
 
     meta, ordered_items, feature_keys, feature_batches = _load_prediction_rows(input_file)
     if len(meta.get("columns", [])) == 0:
@@ -190,13 +212,13 @@ if __name__ == "__main__":
         dim_intensity=None,
         num_classes=2,
         dropout=0.3,
-        max_len=200,
+        max_len=max_peaks,
     )
     model.cuda()
     model = nn.DataParallel(model)
     model.to(device)
 
-    predicted_scores = _predict_scores(model, model_name, feature_batches, device)
+    predicted_scores = _predict_scores(model, model_name, feature_batches, device, max_peaks)
     score_map = {key: score for key, score in zip(feature_keys, predicted_scores)}
     _write_rescored_output(output_file, meta, ordered_items, score_map)
     print("done")

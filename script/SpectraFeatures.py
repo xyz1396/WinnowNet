@@ -9,9 +9,10 @@ from multiprocessing import get_all_start_methods, get_context
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from pkl_utils import PKL_META_KEY, PKL_SCHEMA_VERSION
+from pkl_utils import PKL_META_KEY, PKL_SCHEMA_VERSION, normalize_long_flag_aliases
 
-pairmaxlength = 500
+DEFAULT_MAX_PEAKS = 300
+pairmaxlength = DEFAULT_MAX_PEAKS
 diffDa = 0.01
 
 AA_dict = {
@@ -123,6 +124,24 @@ def _parse_peak_pairs(tokens, start_idx=0):
             continue
         peaks.append([mz, intensity])
     return peaks
+
+
+def _normalize_sip_abundance_args(argv):
+    normalized = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in ("-b", "--sip-abundance"):
+            next_token = argv[i + 1] if i + 1 < len(argv) else None
+            if next_token is None or len(next_token) == 0 or next_token.startswith("-"):
+                normalized.append("--sip-abundance=config")
+            else:
+                normalized.append("--sip-abundance=" + next_token)
+                i += 1
+        else:
+            normalized.append(token)
+        i += 1
+    return normalized
 
 
 def _most_abundant_peak_mz(peaks):
@@ -770,17 +789,30 @@ def print_usage():
     print("-t\t Number of threads\n")
     print("-f\t Attention mode or CNN mode\n")
     print("-c\t Sipros config file for theoretical spectra generator")
+    print("-b\t SIP abundance percentage passed to sipros_theoretical_spectra")
     print("-w\t MS1 isolation window size (m/z, default 10)")
     print("-d\t m/z match tolerance (diffDa, default 0.01 for HRMS)")
     print("-n\t Top N peaks per fragment envelope for CNN match (default 3)")
+    print("--max-peaks\t Number of top-intensity CNN matched peaks kept (default " + str(DEFAULT_MAX_PEAKS) + ")")
+    print("Required input columns: PSMId or SpecId, and Peptide.")
+    print("MS2IsotopicAbundances is required unless -b/--sip-abundance is provided.")
 
 
 def main(argv=None):
     global diffDa
+    global pairmaxlength
     if argv is None:
         argv = sys.argv[1:]
+    argv = normalize_long_flag_aliases(
+        argv,
+        {
+            "-max-peaks": "--max-peaks",
+            "-sip-abundance": "--sip-abundance",
+        },
+    )
+    argv = _normalize_sip_abundance_args(argv)
     try:
-        opts, _ = getopt.getopt(argv, "hi:1:2:o:t:f:c:w:d:n:")
+        opts, _ = getopt.getopt(argv, "hi:1:2:o:t:f:c:w:d:n:", ["max-peaks=", "sip-abundance="])
     except Exception:
         print("Error Option, using -h for help information.")
         return 1
@@ -800,6 +832,8 @@ def main(argv=None):
     num_cpus = str(os.cpu_count() or 1)
     ms1_isolation_window_mz = 10.0
     fragment_env_top_n = 3
+    sip_abundance = ""
+    pairmaxlength = DEFAULT_MAX_PEAKS
     for opt, arg in opts:
         if opt in ("-h"):
             print_usage()
@@ -818,18 +852,25 @@ def main(argv=None):
             mode = arg
         elif opt in ("-c"):
             config_file = arg
+        elif opt in ("-b", "--sip-abundance"):
+            sip_abundance = str(arg).strip()
         elif opt in ("-w"):
             ms1_isolation_window_mz = max(0.0, _to_float(arg, 10.0))
         elif opt in ("-d"):
             diffDa = max(0.0, _to_float(arg, 0.01))
         elif opt in ("-n"):
             fragment_env_top_n = max(1, int(_to_float(arg, 3)))
+        elif opt == "--max-peaks":
+            pairmaxlength = max(1, int(_to_float(arg, DEFAULT_MAX_PEAKS)))
 
     if len(ft2_file) == 0 or len(ft1_file) == 0:
         raise ValueError("Both FT1 and FT2 files are required. Use -1 and -2.")
 
     if len(mode) == 0:
         mode = "att"
+
+    if mode == "cnn":
+        print("Max peaks kept for CNN features: " + str(pairmaxlength))
 
     if len(tsv_file) == 0:
         raise ValueError("A tab delimited PSM file is required. Use -i.")
@@ -876,6 +917,8 @@ def main(argv=None):
         "-t",
         str(num_cpus),
     ]
+    if sip_abundance:
+        cmd.extend(["-b", sip_abundance])
     subprocess.run(cmd, check=True)
 
     D_theory = theoryToDict(theoretical_file)
