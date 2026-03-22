@@ -16,6 +16,13 @@ import glob
 import pickle
 import os
 from components.encoders import MassEncoder, PeakEncoder, PositionalEncoder
+from checkpoint_utils import (
+    build_checkpoint_metadata,
+    format_target_decoy_ratio,
+    load_checkpoint_bundle,
+    prediction_ratio_from_threshold,
+    save_checkpoint_bundle,
+)
 from pkl_utils import (
     expand_pickle_inputs,
     get_entry_label,
@@ -64,12 +71,126 @@ def _parse_positive_int(value, flag_name):
     return parsed
 
 
-def _load_checkpoint_weights(model_path):
-    return torch.load(
-        model_path,
-        map_location=lambda storage, loc: storage,
-        weights_only=True,
+def _parse_target_decoy_ratio(value, flag_name):
+    text = str(value).strip()
+    if len(text) == 0:
+        raise ValueError(f"{flag_name} must not be empty.")
+    if ":" in text:
+        target_text, decoy_text = text.split(":", 1)
+        try:
+            target_count = float(target_text)
+            decoy_count = float(decoy_text)
+        except ValueError:
+            raise ValueError(f"{flag_name} must look like 1:1 or 1:10.")
+        if target_count <= 0 or decoy_count <= 0:
+            raise ValueError(f"{flag_name} values must be greater than 0.")
+        return decoy_count / target_count
+    try:
+        decoy_per_target = float(text)
+    except ValueError:
+        raise ValueError(f"{flag_name} must be a positive number or ratio like 1:1.")
+    if decoy_per_target <= 0:
+        raise ValueError(f"{flag_name} must be greater than 0.")
+    return decoy_per_target
+
+
+def _apply_target_decoy_ratio(X, yweight, decoy_per_target, seed=10, dataset_name="train"):
+    if decoy_per_target is None:
+        return X, yweight
+
+    pos_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 1]
+    neg_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 0]
+    if len(pos_idx) == 0 or len(neg_idx) == 0:
+        print(f"[{dataset_name}] skipped ratio control because one class is empty.")
+        return X, yweight
+
+    max_negatives = max(1, int(round(len(pos_idx) * decoy_per_target)))
+    if len(neg_idx) > max_negatives:
+        rng = np.random.RandomState(seed)
+        neg_idx = rng.choice(neg_idx, size=max_negatives, replace=False).tolist()
+
+    keep_idx = np.asarray(pos_idx + neg_idx, dtype=int)
+    rng = np.random.RandomState(seed)
+    rng.shuffle(keep_idx)
+
+    balanced_X = [X[idx] for idx in keep_idx]
+    balanced_yweight = [yweight[idx] for idx in keep_idx]
+    actual_ratio = len(neg_idx) / float(len(pos_idx))
+    print(
+        f"[{dataset_name}] applied target:decoy ratio 1:{decoy_per_target:.4g}; "
+        f"kept_targets={len(pos_idx)} kept_decoys={len(neg_idx)} actual_ratio=1:{actual_ratio:.4g}"
     )
+    return balanced_X, balanced_yweight
+
+
+def _load_checkpoint_weights(model_path):
+    state_dict, _ = load_checkpoint_bundle(model_path)
+    return state_dict
+
+
+def _compute_decoy_per_target(yweight):
+    positive = sum(1 for item in yweight if int(item[0]) == 1)
+    negative = sum(1 for item in yweight if int(item[0]) == 0)
+    if positive == 0:
+        raise ValueError("Training data must contain at least one target entry.")
+    return negative / float(positive)
+
+
+def _collect_prediction_scores(data, model, loss, device, eval_batch_size):
+    model.eval()
+    data_loader = Data.DataLoader(
+        data,
+        batch_size=eval_batch_size,
+        num_workers=8,
+        shuffle=False,
+        pin_memory=True,
+    )
+
+    total_loss = 0.0
+    y_true = []
+    y_scores = []
+    for input1, input2, label, weight in data_loader:
+        input1 = input1.to(device, non_blocking=True)
+        input2 = input2.to(device, non_blocking=True)
+        label = label.to(device, non_blocking=True)
+        weight = weight.to(device, non_blocking=True)
+
+        output = model(input1, input2)
+        losses = loss(output, label, weight)
+        total_loss += losses.data.item()
+        pred_prob = torch.softmax(output.data, dim=1)[:, 1].detach().cpu().numpy()
+        y_scores.extend(pred_prob.tolist())
+        y_true.extend(label.data.cpu().numpy().tolist())
+
+    data_len = max(1, len(data))
+    return total_loss / data_len, np.asarray(y_true, dtype=int), np.asarray(y_scores, dtype=float)
+
+
+def _select_best_prediction_defaults(y_true, y_scores, train_decoy_per_target):
+    if len(y_scores) == 0:
+        return train_decoy_per_target, 0.5, 0.0
+
+    candidate_thresholds = np.unique(np.asarray(y_scores, dtype=float))
+    if len(candidate_thresholds) > 512:
+        quantiles = np.linspace(0.0, 1.0, 512)
+        candidate_thresholds = np.quantile(candidate_thresholds, quantiles)
+    candidate_thresholds = np.unique(
+        np.clip(np.concatenate(([1e-6, 0.5, 1.0 - 1e-6], candidate_thresholds)), 1e-6, 1.0 - 1e-6)
+    )
+
+    best_metric = -1.0
+    best_threshold = 0.5
+    for threshold_value in candidate_thresholds:
+        y_pred = (y_scores >= threshold_value).astype(int)
+        metric_value = metrics.f1_score(y_true, y_pred, average="macro", zero_division=0)
+        if metric_value > best_metric + 1e-12:
+            best_metric = metric_value
+            best_threshold = float(threshold_value)
+        elif abs(metric_value - best_metric) <= 1e-12 and abs(threshold_value - 0.5) < abs(best_threshold - 0.5):
+            best_threshold = float(threshold_value)
+
+    best_ratio = prediction_ratio_from_threshold(train_decoy_per_target, best_threshold)
+    return best_ratio, best_threshold, best_metric
 
 
 def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset"):
@@ -318,36 +439,10 @@ def evaluate(data, model, loss, device, eval_batch_size):
         y_true.extend(label.data.cpu().numpy().tolist())
 
     acc = (np.array(y_true) == np.array(y_pred)).sum()
-    TP = 0
-    FP = 0
-    TN = 0
-    FN = 0
-    Pos_prec = 0
-    Neg_prec = 0
+    positive_precision = metrics.precision_score(y_true, y_pred, pos_label=1, zero_division=0)
+    negative_precision = metrics.precision_score(y_true, y_pred, pos_label=0, zero_division=0)
 
-    for idx in range(len(y_pred)):
-        if y_pred[idx] == 1:
-            if y_true[idx] == 1:
-                TP += 1
-            else:
-                FP += 1
-        else:
-            if y_true[idx] == 1:
-                TN += 1
-            else:
-                FN += 1
-
-    if y_pred.count(1) == 0:
-        Pos_prec = 0
-        Neg_prec = FN / (TN + FN)
-    elif y_pred.count(0) == 0:
-        Pos_prec = TP / (TP + FP)
-        Neg_prec = 0
-    else:
-        Pos_prec = TP / (TP + FP)
-        Neg_prec = FN / (TN + FN)
-
-    return acc / data_len, total_loss / data_len, Pos_prec, Neg_prec
+    return acc / data_len, total_loss / data_len, positive_precision, negative_precision
 
 
 
@@ -379,10 +474,10 @@ def test_model(model, test_data, device, model_str, eval_batch_size):
 
     print("Precision, Recall and F1-Score...")
     print(metrics.classification_report(
-        y_true, y_pred, target_names=['T', 'D']))
+        y_true, y_pred, labels=[1, 0], target_names=['T', 'D'], zero_division=0))
 
     print('Confusion Matrix...')
-    cm = metrics.confusion_matrix(y_true, y_pred)
+    cm = metrics.confusion_matrix(y_true, y_pred, labels=[1, 0])
     print(cm)
 
     print("Time usage:", get_time_dif(start_time))
@@ -425,6 +520,7 @@ def train_model(
     #model.load_state_dict(torch.load('cnn_pytorch.pt', map_location=lambda storage, loc: storage))
     #test_model(model, test_data, device)
     best_loss = 10000
+    train_decoy_per_target = _compute_decoy_per_target(yweight_train)
     scaler = GradScaler("cuda")
     train_loader = Data.DataLoader(
         train_data,
@@ -452,21 +548,40 @@ def train_model(
         val_acc, val_loss, val_PosPrec, val_Negprec = evaluate(
             val_data, model, criterion, device, eval_batch_size
         )
+        _, val_y_true, val_y_scores = _collect_prediction_scores(
+            val_data,
+            model,
+            criterion,
+            device,
+            eval_batch_size,
+        )
+        best_prediction_ratio, best_threshold, best_macro_f1 = _select_best_prediction_defaults(
+            val_y_true,
+            val_y_scores,
+            train_decoy_per_target,
+        )
+        checkpoint_metadata = build_checkpoint_metadata(
+            model_type="att",
+            train_target_decoy_ratio=train_decoy_per_target,
+            best_prediction_target_decoy_ratio=best_prediction_ratio,
+            best_decision_threshold=best_threshold,
+            max_peaks=max_peaks,
+        )
         checkpoint_path = os.path.join(checkpoint_dir, 'epoch' + str(epoch) + '.pt')
-        torch.save(model.state_dict(), checkpoint_path)
+        save_checkpoint_bundle(checkpoint_path, model.state_dict(), checkpoint_metadata)
         checkpoint_paths.append(checkpoint_path)
         print("Saved checkpoint: " + checkpoint_path)
         if val_loss < best_loss:
             best_loss = val_loss
-            torch.save(model.state_dict(), model_output_path)
+            save_checkpoint_bundle(model_output_path, model.state_dict(), checkpoint_metadata)
             print("Saved best model: " + model_output_path)
 
         time_dif = get_time_dif(start_time)
         msg = "Epoch {0:3}, Train_loss: {1:>7.2}, Train_acc {2:>6.2%}, Train_Posprec {3:>6.2%}, Train_Negprec {" \
-              "4:>6.2%}, " + "Val_loss: {5:>6.2}, Val_acc {6:>6.2%},Val_Posprec {7:6.2%}, Val_Negprec {8:6.2%} " \
-                             "Time: {9} "
+              "4:>6.2%}, " + "Val_loss: {5:>6.2}, Val_acc {6:>6.2%},Val_Posprec {7:6.2%}, Val_Negprec {8:6.2%}, " \
+              "BestPredRatio {9}, BestThreshold {10:.4f}, BestMacroF1 {11:>6.2%} Time: {12} "
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
-                         val_PosPrec, val_Negprec, time_dif))
+                         val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, best_macro_f1, time_dif))
 
     for checkpoint_path in checkpoint_paths:
         test_model(model, test_data, device, checkpoint_path, eval_batch_size)
@@ -481,13 +596,14 @@ if __name__ == "__main__":
             "-train-batch-size": "--train-batch-size",
             "-eval-batch-size": "--eval-batch-size",
             "-max-peaks": "--max-peaks",
+            "-target-decoy-ratio": "--target-decoy-ratio",
         },
     )
     try:
         opts, args = getopt.getopt(
             argv,
             "hi:m:p:",
-            ["target=", "decoy=", "train-batch-size=", "eval-batch-size=", "max-peaks="],
+            ["target=", "decoy=", "train-batch-size=", "eval-batch-size=", "max-peaks=", "target-decoy-ratio="],
         )
     except:
         print("Error Option, using -h for help information.")
@@ -502,6 +618,7 @@ if __name__ == "__main__":
         print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
         print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
         print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
+        print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
         sys.exit(1)
         start_time=time.time()
     input_directory=""
@@ -510,6 +627,7 @@ if __name__ == "__main__":
     train_batch_size = DEFAULT_TRAIN_BATCH_SIZE
     eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
     max_peaks = DEFAULT_MAX_PEAKS
+    target_decoy_ratio = None
     target_inputs = []
     decoy_inputs = []
     for opt, arg in opts:
@@ -523,6 +641,7 @@ if __name__ == "__main__":
             print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
             print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
             print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
+            print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
             sys.exit(1)
         elif opt in ("-i"):
             input_directory=arg
@@ -540,6 +659,8 @@ if __name__ == "__main__":
             eval_batch_size = _parse_positive_int(arg, "--eval-batch-size")
         elif opt == "--max-peaks":
             max_peaks = _parse_positive_int(arg, "--max-peaks")
+        elif opt == "--target-decoy-ratio":
+            target_decoy_ratio = _parse_target_decoy_ratio(arg, "--target-decoy-ratio")
     start = time.time()
     split_mode = bool(target_inputs or decoy_inputs)
     if not split_mode and len(input_directory) == 0:
@@ -570,6 +691,13 @@ if __name__ == "__main__":
             raise ValueError(f"No feature pickles found under {input_directory}.")
         L, Yweight = _load_feature_records(target_pickles, dataset_name="embedded")
         (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_list(L, Yweight)
+
+    X_train, yweight_train = _apply_target_decoy_ratio(
+        X_train,
+        yweight_train,
+        target_decoy_ratio,
+        dataset_name="train",
+    )
 
     end = time.time()
     print('loading data: ' + str(end - start))
