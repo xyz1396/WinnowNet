@@ -95,32 +95,26 @@ def _parse_target_decoy_ratio(value, flag_name):
 
 
 def _apply_target_decoy_ratio(X, yweight, decoy_per_target, seed=10, dataset_name="train"):
-    if decoy_per_target is None:
-        return X, yweight
-
     pos_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 1]
     neg_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 0]
     if len(pos_idx) == 0 or len(neg_idx) == 0:
-        print(f"[{dataset_name}] skipped ratio control because one class is empty.")
-        return X, yweight
+        raise ValueError(f"[{dataset_name}] requires both target and decoy samples.")
 
-    max_negatives = max(1, int(round(len(pos_idx) * decoy_per_target)))
-    if len(neg_idx) > max_negatives:
-        rng = np.random.RandomState(seed)
-        neg_idx = rng.choice(neg_idx, size=max_negatives, replace=False).tolist()
+    natural_ratio = len(neg_idx) / float(len(pos_idx))
+    if decoy_per_target is None:
+        print(
+            f"[{dataset_name}] using full training pool; "
+            f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)} "
+            f"natural_ratio=1:{natural_ratio:.4g}"
+        )
+        return X, yweight, natural_ratio
 
-    keep_idx = np.asarray(pos_idx + neg_idx, dtype=int)
-    rng = np.random.RandomState(seed)
-    rng.shuffle(keep_idx)
-
-    balanced_X = [X[idx] for idx in keep_idx]
-    balanced_yweight = [yweight[idx] for idx in keep_idx]
-    actual_ratio = len(neg_idx) / float(len(pos_idx))
     print(
-        f"[{dataset_name}] applied target:decoy ratio 1:{decoy_per_target:.4g}; "
-        f"kept_targets={len(pos_idx)} kept_decoys={len(neg_idx)} actual_ratio=1:{actual_ratio:.4g}"
+        f"[{dataset_name}] using full training pool with weighted sampling; "
+        f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)} "
+        f"natural_ratio=1:{natural_ratio:.4g} effective_ratio=1:{decoy_per_target:.4g}"
     )
-    return balanced_X, balanced_yweight
+    return X, yweight, decoy_per_target
 
 
 def _load_checkpoint_weights(model_path):
@@ -134,6 +128,45 @@ def _compute_decoy_per_target(yweight):
     if positive == 0:
         raise ValueError("Training data must contain at least one target entry.")
     return negative / float(positive)
+
+
+def _build_train_loader(train_data, yweight_train, batch_size, effective_decoy_per_target, seed=10):
+    if effective_decoy_per_target is None:
+        return Data.DataLoader(
+            train_data,
+            batch_size=batch_size,
+            num_workers=8,
+            shuffle=True,
+            pin_memory=True,
+        )
+
+    positive = sum(1 for item in yweight_train if int(item[0]) == 1)
+    negative = sum(1 for item in yweight_train if int(item[0]) == 0)
+    if positive == 0 or negative == 0:
+        raise ValueError("Training data must contain both target and decoy samples.")
+
+    positive_probability = 1.0 / (1.0 + effective_decoy_per_target)
+    negative_probability = effective_decoy_per_target / (1.0 + effective_decoy_per_target)
+    sample_weights = [
+        positive_probability / float(positive) if int(item[0]) == 1 else negative_probability / float(negative)
+        for item in yweight_train
+    ]
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    sampler = Data.WeightedRandomSampler(
+        weights=torch.DoubleTensor(sample_weights),
+        num_samples=len(yweight_train),
+        replacement=True,
+        generator=generator,
+    )
+    return Data.DataLoader(
+        train_data,
+        batch_size=batch_size,
+        num_workers=8,
+        shuffle=False,
+        sampler=sampler,
+        pin_memory=True,
+    )
 
 
 def _collect_prediction_scores(data, model, loss, device, eval_batch_size):
@@ -239,10 +272,9 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
                 negative += 1
                 kept_rows += 1
 
-    print(positive)
-    print(negative)
     print(
-        f"[{dataset_name}] total_rows={total_rows} kept_rows={kept_rows} "
+        f"[{dataset_name}] kept_targets={positive} kept_decoys={negative} "
+        f"total_rows={total_rows} kept_rows={kept_rows} "
         f"unlabeled_rows={unlabeled_rows} skipped_label_not_1={skipped_non_one}"
     )
     return L, Yweight
@@ -495,6 +527,7 @@ def train_model(
     train_batch_size,
     eval_batch_size,
     max_peaks,
+    effective_train_decoy_ratio,
 ):
     LR = 1e-4
     train_data = DefineDataset(X_train, yweight_train, max_peaks=max_peaks)
@@ -520,14 +553,13 @@ def train_model(
     #model.load_state_dict(torch.load('cnn_pytorch.pt', map_location=lambda storage, loc: storage))
     #test_model(model, test_data, device)
     best_loss = 10000
-    train_decoy_per_target = _compute_decoy_per_target(yweight_train)
+    train_decoy_per_target = effective_train_decoy_ratio
     scaler = GradScaler("cuda")
-    train_loader = Data.DataLoader(
+    train_loader = _build_train_loader(
         train_data,
-        batch_size=train_batch_size,
-        num_workers=8,
-        shuffle=True,
-        pin_memory=True,
+        yweight_train,
+        train_batch_size,
+        train_decoy_per_target,
     )
     for epoch in range(0, 80):
         start_time = time.time()
@@ -692,7 +724,7 @@ if __name__ == "__main__":
         L, Yweight = _load_feature_records(target_pickles, dataset_name="embedded")
         (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_list(L, Yweight)
 
-    X_train, yweight_train = _apply_target_decoy_ratio(
+    X_train, yweight_train, effective_train_decoy_ratio = _apply_target_decoy_ratio(
         X_train,
         yweight_train,
         target_decoy_ratio,
@@ -716,5 +748,6 @@ if __name__ == "__main__":
         train_batch_size,
         eval_batch_size,
         max_peaks,
+        effective_train_decoy_ratio,
     )
     print('done')
