@@ -12,8 +12,6 @@ from WinnowNet_CNN import Net
 from pkl_utils import (
     choose_output_column,
     format_label_value,
-    get_entry_label,
-    get_entry_label_raw,
     get_entry_model_input,
     get_entry_row_index,
     get_entry_row_map,
@@ -40,6 +38,14 @@ def _qvalue_to_string(qvalue):
     if qvalue == "":
         return ""
     return f"{float(qvalue):.10g}"
+
+
+def _load_checkpoint_weights(model_path):
+    return torch.load(
+        model_path,
+        map_location=lambda storage, loc: storage,
+        weights_only=True,
+    )
 
 
 def _compute_qvalues(scores, labels):
@@ -71,16 +77,18 @@ def _compute_qvalues(scores, labels):
 def _predict_scores(model, model_name, feature_batches, device):
     test_data = DefineDataset(feature_batches)
     test_loader = Data.DataLoader(test_data, batch_size=32)
-    model.load_state_dict(torch.load(model_name, map_location=lambda storage, loc: storage))
+    model.load_state_dict(_load_checkpoint_weights(model_name))
     model.eval()
 
     y_pred_prob = []
+    y_pred = []
     for data1 in test_loader:
         data1 = Variable(data1).to(device)
         output = model(data1)
         pred_prob = torch.softmax(output.data, dim=1).cpu().numpy()
+        y_pred.extend(np.argmax(pred_prob, axis=1).tolist())
         y_pred_prob.extend(pred_prob[:, 1].tolist())
-    return y_pred_prob
+    return y_pred_prob, y_pred
 
 
 def _load_prediction_rows(input_file):
@@ -102,7 +110,7 @@ def _load_prediction_rows(input_file):
     return meta, ordered_items, feature_keys, feature_batches
 
 
-def _write_rescored_output(output_file, meta, ordered_items, score_map):
+def _write_rescored_output(output_file, meta, ordered_items, score_map, predicted_label_map):
     base_columns = list(meta.get("columns", []))
     score_column = choose_output_column(base_columns, ["score"], "score")
     qvalue_column = choose_output_column(base_columns, ["q-value", "qvalue"], "q-value")
@@ -113,27 +121,40 @@ def _write_rescored_output(output_file, meta, ordered_items, score_map):
         if column not in output_columns:
             output_columns.append(column)
 
-    labels = [get_entry_label(entry) for _, entry in ordered_items]
+    labels = [predicted_label_map.get(key) for key, _ in ordered_items]
     scores = [score_map.get(key) for key, _ in ordered_items]
     qvalues = _compute_qvalues(scores, labels)
+    ranked_rows = []
+    for idx, (key, entry) in enumerate(ordered_items):
+        ranked_rows.append(
+            {
+                "sort_score": float("-inf") if scores[idx] is None else float(scores[idx]),
+                "row_index": idx,
+                "key": key,
+                "entry": entry,
+                "score": scores[idx],
+                "qvalue": qvalues[idx],
+                "label": labels[idx],
+            }
+        )
+    ranked_rows.sort(key=lambda item: (-item["sort_score"], item["row_index"]))
 
     with open(output_file, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=output_columns, delimiter="\t", extrasaction="ignore")
         writer.writeheader()
-        for idx, (key, entry) in enumerate(ordered_items):
+        for row in ranked_rows:
+            key = row["key"]
+            entry = row["entry"]
             row_map = get_entry_row_map(meta, key, entry)
-            score = scores[idx]
+            score = row["score"]
             if score is not None:
                 row_map[score_column] = _score_to_string(score)
             elif score_column not in row_map:
                 row_map[score_column] = ""
-            qvalue_text = _qvalue_to_string(qvalues[idx])
+            qvalue_text = _qvalue_to_string(row["qvalue"])
             if qvalue_text != "" or qvalue_column not in row_map:
                 row_map[qvalue_column] = qvalue_text
-            label_text = format_label_value(
-                labels[idx],
-                get_entry_label_raw(entry),
-            )
+            label_text = format_label_value(row["label"], None)
             if label_text != "" or label_column not in row_map:
                 row_map[label_column] = label_text
             writer.writerow({column: row_map.get(column, "") for column in output_columns})
@@ -180,7 +201,8 @@ if __name__ == "__main__":
     model = nn.DataParallel(model)
     model.to(device)
 
-    predicted_scores = _predict_scores(model, model_name, feature_batches, device)
+    predicted_scores, predicted_labels = _predict_scores(model, model_name, feature_batches, device)
     score_map = {key: score for key, score in zip(feature_keys, predicted_scores)}
-    _write_rescored_output(output_file, meta, ordered_items, score_map)
+    predicted_label_map = {key: label for key, label in zip(feature_keys, predicted_labels)}
+    _write_rescored_output(output_file, meta, ordered_items, score_map, predicted_label_map)
     print("done")

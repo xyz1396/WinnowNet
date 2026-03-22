@@ -64,6 +64,14 @@ def _parse_positive_int(value, flag_name):
     return parsed
 
 
+def _load_checkpoint_weights(model_path):
+    return torch.load(
+        model_path,
+        map_location=lambda storage, loc: storage,
+        weights_only=True,
+    )
+
+
 def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset"):
     L = []
     Yweight = []
@@ -349,7 +357,7 @@ def test_model(model, test_data, device, model_str, eval_batch_size):
     start_time = time.time()
     test_loader = Data.DataLoader(test_data, batch_size=eval_batch_size)
 
-    model.load_state_dict(torch.load(model_str, map_location=lambda storage, loc: storage))
+    model.load_state_dict(_load_checkpoint_weights(model_str))
 
     y_true, y_pred, y_pred_prob = [], [], []
     for data1,addfeat,label, weight in test_loader:
@@ -411,7 +419,7 @@ def train_model(
     model.to(device)
     if len(pretrained_model)>0:
         print("loading pretrained_model")
-        model.load_state_dict(torch.load(pretrained_model, map_location=lambda storage, loc: storage))
+        model.load_state_dict(_load_checkpoint_weights(pretrained_model))
     criterion = my_loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
     #model.load_state_dict(torch.load('cnn_pytorch.pt', map_location=lambda storage, loc: storage))
