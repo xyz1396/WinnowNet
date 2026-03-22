@@ -36,6 +36,7 @@ threshold=0.9
 DEFAULT_TRAIN_BATCH_SIZE = 64
 DEFAULT_EVAL_BATCH_SIZE = 128
 DEFAULT_MAX_PEAKS = 300
+DEFAULT_SELECTION_MAX_FDR = 0.01
 
 
 def _label_matches_expected(entry):
@@ -131,7 +132,16 @@ def _compute_decoy_per_target(yweight):
 
 
 def _build_train_loader(train_data, yweight_train, batch_size, effective_decoy_per_target, seed=10):
+    total_samples = len(yweight_train)
     if effective_decoy_per_target is None:
+        natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
+        target_probability = 1.0 / (1.0 + natural_decoy_per_target)
+        decoy_probability = natural_decoy_per_target / (1.0 + natural_decoy_per_target)
+        target_count = int(round(total_samples * target_probability))
+        decoy_count = total_samples - target_count
+        print(
+            f"[train] sampler target_count~{target_count} decoy_count~{decoy_count}"
+        )
         return Data.DataLoader(
             train_data,
             batch_size=batch_size,
@@ -147,6 +157,11 @@ def _build_train_loader(train_data, yweight_train, batch_size, effective_decoy_p
 
     positive_probability = 1.0 / (1.0 + effective_decoy_per_target)
     negative_probability = effective_decoy_per_target / (1.0 + effective_decoy_per_target)
+    target_count = int(round(total_samples * positive_probability))
+    decoy_count = total_samples - target_count
+    print(
+        f"[train] sampler target_count~{target_count} decoy_count~{decoy_count}"
+    )
     sample_weights = [
         positive_probability / float(positive) if int(item[0]) == 1 else negative_probability / float(negative)
         for item in yweight_train
@@ -201,7 +216,7 @@ def _collect_prediction_scores(data, model, loss, device, eval_batch_size):
 
 def _select_best_prediction_defaults(y_true, y_scores, train_decoy_per_target):
     if len(y_scores) == 0:
-        return train_decoy_per_target, 0.5, 0.0
+        return train_decoy_per_target, 0.5, 0, 0.0
 
     candidate_thresholds = np.unique(np.asarray(y_scores, dtype=float))
     if len(candidate_thresholds) > 512:
@@ -211,19 +226,29 @@ def _select_best_prediction_defaults(y_true, y_scores, train_decoy_per_target):
         np.clip(np.concatenate(([1e-6, 0.5, 1.0 - 1e-6], candidate_thresholds)), 1e-6, 1.0 - 1e-6)
     )
 
-    best_metric = -1.0
-    best_threshold = 0.5
+    best_target_count = -1
+    best_fdr = 1.0
+    best_threshold = float(max(candidate_thresholds))
     for threshold_value in candidate_thresholds:
-        y_pred = (y_scores >= threshold_value).astype(int)
-        metric_value = metrics.f1_score(y_true, y_pred, average="macro", zero_division=0)
-        if metric_value > best_metric + 1e-12:
-            best_metric = metric_value
+        accepted = y_scores >= threshold_value
+        target_count = int(np.sum((y_true == 1) & accepted))
+        decoy_count = int(np.sum((y_true == 0) & accepted))
+        current_fdr = 0.0 if target_count == 0 else decoy_count / float(target_count)
+        if current_fdr > DEFAULT_SELECTION_MAX_FDR:
+            continue
+        if target_count > best_target_count:
+            best_target_count = target_count
+            best_fdr = current_fdr
             best_threshold = float(threshold_value)
-        elif abs(metric_value - best_metric) <= 1e-12 and abs(threshold_value - 0.5) < abs(best_threshold - 0.5):
-            best_threshold = float(threshold_value)
+        elif target_count == best_target_count:
+            if current_fdr < best_fdr - 1e-12:
+                best_fdr = current_fdr
+                best_threshold = float(threshold_value)
+            elif abs(current_fdr - best_fdr) <= 1e-12 and threshold_value > best_threshold:
+                best_threshold = float(threshold_value)
 
     best_ratio = prediction_ratio_from_threshold(train_decoy_per_target, best_threshold)
-    return best_ratio, best_threshold, best_metric
+    return best_ratio, best_threshold, best_target_count, best_fdr
 
 
 def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset"):
@@ -587,7 +612,7 @@ def train_model(
             device,
             eval_batch_size,
         )
-        best_prediction_ratio, best_threshold, best_macro_f1 = _select_best_prediction_defaults(
+        best_prediction_ratio, best_threshold, best_target_count, best_val_fdr = _select_best_prediction_defaults(
             val_y_true,
             val_y_scores,
             train_decoy_per_target,
@@ -611,9 +636,9 @@ def train_model(
         time_dif = get_time_dif(start_time)
         msg = "Epoch {0:3}, Train_loss: {1:>7.2}, Train_acc {2:>6.2%}, Train_Posprec {3:>6.2%}, Train_Negprec {" \
               "4:>6.2%}, " + "Val_loss: {5:>6.2}, Val_acc {6:>6.2%},Val_Posprec {7:6.2%}, Val_Negprec {8:6.2%}, " \
-              "BestPredRatio {9}, BestThreshold {10:.4f}, BestMacroF1 {11:>6.2%} Time: {12} "
+              "BestPredRatio {9}, BestThreshold {10:.4f}, BestTargets@FDR<=1% {11}, BestValFDR {12:.4%} Time: {13} "
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
-                         val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, best_macro_f1, time_dif))
+                         val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, best_target_count, best_val_fdr, time_dif))
 
     for checkpoint_path in checkpoint_paths:
         test_model(model, test_data, device, checkpoint_path, eval_batch_size)
