@@ -577,7 +577,7 @@ def train_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
     #model.load_state_dict(torch.load('cnn_pytorch.pt', map_location=lambda storage, loc: storage))
     #test_model(model, test_data, device)
-    best_loss = 10000
+    best_loss = float("inf")
     train_decoy_per_target = effective_train_decoy_ratio
     scaler = GradScaler("cuda")
     train_loader = _build_train_loader(
@@ -612,7 +612,7 @@ def train_model(
             device,
             eval_batch_size,
         )
-        best_prediction_ratio, best_threshold, best_target_count, best_val_fdr = _select_best_prediction_defaults(
+        best_prediction_ratio, best_threshold, epoch_best_target_count, best_val_fdr = _select_best_prediction_defaults(
             val_y_true,
             val_y_scores,
             train_decoy_per_target,
@@ -638,7 +638,7 @@ def train_model(
               "4:>6.2%}, " + "Val_loss: {5:>6.2}, Val_acc {6:>6.2%},Val_Posprec {7:6.2%}, Val_Negprec {8:6.2%}, " \
               "BestPredRatio {9}, BestThreshold {10:.4f}, BestTargets@FDR<=1% {11}, BestValFDR {12:.4%} Time: {13} "
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
-                         val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, best_target_count, best_val_fdr, time_dif))
+                         val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, epoch_best_target_count, best_val_fdr, time_dif))
 
     for checkpoint_path in checkpoint_paths:
         test_model(model, test_data, device, checkpoint_path, eval_batch_size)
