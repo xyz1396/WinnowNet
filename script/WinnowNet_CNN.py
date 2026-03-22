@@ -31,6 +31,7 @@ from pkl_utils import (
 )
 
 threshold=0.9
+DEFAULT_EPOCHS = 50
 DEFAULT_SELECTION_MAX_FDR = 0.01
 def _label_matches_expected(entry):
     label = get_entry_label(entry)
@@ -491,7 +492,7 @@ def test_model(model, test_data, device):
     print("Time usage:", get_time_dif(start_time))
 
 
-def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test,model_name,pretrained_model,effective_train_decoy_ratio):
+def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test,model_name,pretrained_model,effective_train_decoy_ratio, epochs):
     LR = 1e-3
     train_data = DefineDataset(X_train, yweight_train)
     val_data = DefineDataset(X_val, yweight_val)
@@ -512,8 +513,9 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
     #test_model(model, test_data, device)
     best_loss = 10000
     train_decoy_per_target = effective_train_decoy_ratio
+    print("Epochs: " + str(epochs))
     train_loader = _build_train_loader(train_data, yweight_train, train_decoy_per_target)
-    for epoch in range(0, 50):
+    for epoch in range(0, epochs):
         start_time = time.time()
         best_epoch_loss = 10000
         # load the training data in batch
@@ -565,11 +567,12 @@ if __name__ == "__main__":
         {
             "-target": "--target",
             "-decoy": "--decoy",
+            "-epochs": "--epochs",
             "-target-decoy-ratio": "--target-decoy-ratio",
         },
     )
     try:
-        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy=", "target-decoy-ratio="])
+        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy=", "epochs=", "target-decoy-ratio="])
     except:
         print("Error Option, using -h for help information.")
         sys.exit(1)
@@ -580,12 +583,14 @@ if __name__ == "__main__":
         print("-p\t Optional pretrained model name\n")
         print("-target\t Target feature pickle(s), comma-separated or repeated\n")
         print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
+        print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
         print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
         sys.exit(1)
         start_time=time.time()
     input_directory=""
     model_name=""
     pretrained_model=""
+    epochs = DEFAULT_EPOCHS
     target_decoy_ratio = None
     target_inputs = []
     decoy_inputs = []
@@ -597,6 +602,7 @@ if __name__ == "__main__":
             print("-p\t Optional pretrained model name\n")
             print("-target\t Target feature pickle(s), comma-separated or repeated\n")
             print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
+            print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
             print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
             sys.exit(1)
         elif opt in ("-i"):
@@ -609,6 +615,10 @@ if __name__ == "__main__":
             target_inputs.append(arg)
         elif opt == "--decoy":
             decoy_inputs.append(arg)
+        elif opt == "--epochs":
+            epochs = int(arg)
+            if epochs <= 0:
+                raise ValueError("--epochs must be greater than 0.")
         elif opt == "--target-decoy-ratio":
             target_decoy_ratio = _parse_target_decoy_ratio(arg, "--target-decoy-ratio")
     start = time.time()
@@ -654,5 +664,5 @@ if __name__ == "__main__":
     print("length of training data: " + str(len(X_train)))
     print("length of validation data: " + str(len(X_val)))
     print("length of test data: " + str(len(X_test)))
-    train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test, model_name, pretrained_model, effective_train_decoy_ratio)
+    train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test, model_name, pretrained_model, effective_train_decoy_ratio, epochs)
     print('done')

@@ -36,6 +36,7 @@ threshold=0.9
 DEFAULT_TRAIN_BATCH_SIZE = 64
 DEFAULT_EVAL_BATCH_SIZE = 128
 DEFAULT_MAX_PEAKS = 300
+DEFAULT_EPOCHS = 50
 DEFAULT_SELECTION_MAX_FDR = 0.01
 
 
@@ -553,6 +554,7 @@ def train_model(
     eval_batch_size,
     max_peaks,
     effective_train_decoy_ratio,
+    epochs,
 ):
     LR = 1e-4
     train_data = DefineDataset(X_train, yweight_train, max_peaks=max_peaks)
@@ -565,6 +567,7 @@ def train_model(
     print("Train batch size: " + str(train_batch_size))
     print("Eval batch size: " + str(eval_batch_size))
     print("Max peaks kept per spectrum: " + str(max_peaks))
+    print("Epochs: " + str(epochs))
     device = torch.device("cuda")
     model = DualPeakClassifier(dim_model=256,n_heads=4,dim_feedforward=512,n_layers=4,dim_intensity=None,num_classes=2,dropout=0.3,max_len=max_peaks)
     model.cuda()
@@ -586,7 +589,7 @@ def train_model(
         train_batch_size,
         train_decoy_per_target,
     )
-    for epoch in range(0, 80):
+    for epoch in range(0, epochs):
         start_time = time.time()
         model.train()
         for input1, input2, y_batch, weight in train_loader:
@@ -653,6 +656,7 @@ if __name__ == "__main__":
             "-train-batch-size": "--train-batch-size",
             "-eval-batch-size": "--eval-batch-size",
             "-max-peaks": "--max-peaks",
+            "-epochs": "--epochs",
             "-target-decoy-ratio": "--target-decoy-ratio",
         },
     )
@@ -660,7 +664,7 @@ if __name__ == "__main__":
         opts, args = getopt.getopt(
             argv,
             "hi:m:p:",
-            ["target=", "decoy=", "train-batch-size=", "eval-batch-size=", "max-peaks=", "target-decoy-ratio="],
+            ["target=", "decoy=", "train-batch-size=", "eval-batch-size=", "max-peaks=", "epochs=", "target-decoy-ratio="],
         )
     except:
         print("Error Option, using -h for help information.")
@@ -675,6 +679,7 @@ if __name__ == "__main__":
         print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
         print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
         print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
+        print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
         print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
         sys.exit(1)
         start_time=time.time()
@@ -684,6 +689,7 @@ if __name__ == "__main__":
     train_batch_size = DEFAULT_TRAIN_BATCH_SIZE
     eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
     max_peaks = DEFAULT_MAX_PEAKS
+    epochs = DEFAULT_EPOCHS
     target_decoy_ratio = None
     target_inputs = []
     decoy_inputs = []
@@ -698,6 +704,7 @@ if __name__ == "__main__":
             print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
             print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
             print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
+            print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
             print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
             sys.exit(1)
         elif opt in ("-i"):
@@ -716,6 +723,8 @@ if __name__ == "__main__":
             eval_batch_size = _parse_positive_int(arg, "--eval-batch-size")
         elif opt == "--max-peaks":
             max_peaks = _parse_positive_int(arg, "--max-peaks")
+        elif opt == "--epochs":
+            epochs = _parse_positive_int(arg, "--epochs")
         elif opt == "--target-decoy-ratio":
             target_decoy_ratio = _parse_target_decoy_ratio(arg, "--target-decoy-ratio")
     start = time.time()
@@ -774,5 +783,6 @@ if __name__ == "__main__":
         eval_batch_size,
         max_peaks,
         effective_train_decoy_ratio,
+        epochs,
     )
     print('done')
