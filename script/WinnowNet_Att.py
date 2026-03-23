@@ -263,9 +263,16 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
     unlabeled_rows = 0
 
     for feature_path in feature_paths:
+        file_positive = 0
+        file_negative = 0
+        file_total_rows = 0
+        file_kept_rows = 0
+        file_skipped_non_one = 0
+        file_unlabeled_rows = 0
         _, entries = load_feature_pickle(feature_path)
         for _, entry in entries.items():
             total_rows += 1
+            file_total_rows += 1
             model_input = get_entry_model_input(entry)
             if model_input is None:
                 continue
@@ -280,8 +287,10 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             else:
                 if get_entry_label(entry) is None:
                     unlabeled_rows += 1
+                    file_unlabeled_rows += 1
                 elif not _label_matches_expected(entry):
                     skipped_non_one += 1
+                    file_skipped_non_one += 1
                     continue
                 label = force_label
                 confidence = 1.0 if force_label == 1 else 0.0
@@ -291,12 +300,23 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
                     L.append(model_input)
                     Yweight.append([1, 1])
                     positive += 1
+                    file_positive += 1
                     kept_rows += 1
+                    file_kept_rows += 1
             else:
                 L.append(model_input)
                 Yweight.append([0, confidence])
                 negative += 1
+                file_negative += 1
                 kept_rows += 1
+                file_kept_rows += 1
+
+        print(
+            f"[{dataset_name}:file] path={os.path.abspath(feature_path)} "
+            f"kept_psms={file_kept_rows} kept_targets={file_positive} kept_decoys={file_negative} "
+            f"total_rows={file_total_rows} unlabeled_rows={file_unlabeled_rows} "
+            f"skipped_label_not_1={file_skipped_non_one}"
+        )
 
     print(
         f"[{dataset_name}] kept_targets={positive} kept_decoys={negative} "
