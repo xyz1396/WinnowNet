@@ -340,7 +340,7 @@ def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
     val_groups = {groups[i] for i in val_idx}
     test_groups = {groups[i] for i in test_idx}
     print(
-        "[split] grouped by peptide+charge; "
+        "[split] grouped by peptide; "
         f"total_groups={len(group_to_indices)} "
         f"train_groups={len(train_groups)} val_groups={len(val_groups)} test_groups={len(test_groups)}"
     )
@@ -515,13 +515,25 @@ def evaluate(data, model, loss, device):
 
 
 
-def test_model(model, test_data, device):
+def _format_checkpoint_label(model_path):
+    base_name = os.path.basename(model_path)
+    stem, _ = os.path.splitext(base_name)
+    if stem.startswith("epoch"):
+        epoch_text = stem[len("epoch"):]
+        if epoch_text.isdigit():
+            return f"{base_name} (Epoch {int(epoch_text) + 1})"
+    return base_name
+
+
+def test_model(model, test_data, device, model_str):
     print("Testing...")
+    print("Checkpoint: " + _format_checkpoint_label(model_str))
+    print("Checkpoint path: " + os.path.abspath(model_str))
     model.eval()
     start_time = time.time()
     test_loader = Data.DataLoader(test_data,batch_size=32)
 
-    model.load_state_dict(_load_checkpoint_weights('cnn_pytorch.pt'))
+    model.load_state_dict(_load_checkpoint_weights(model_str))
 
     y_true, y_pred, y_pred_prob = [], [], []
     for data1,label, weight in test_loader:
@@ -575,6 +587,7 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
     train_decoy_per_target = effective_train_decoy_ratio
     print("Epochs: " + str(epochs))
     train_loader = _build_train_loader(train_data, yweight_train, train_decoy_per_target)
+    checkpoint_paths = []
     for epoch in range(0, epochs):
         start_time = time.time()
         best_epoch_loss = 10000
@@ -607,7 +620,9 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
             best_prediction_target_decoy_ratio=best_prediction_ratio,
             best_decision_threshold=best_threshold,
         )
-        save_checkpoint_bundle('checkpoints/epoch' + str(epoch) + '.pt', model.state_dict(), checkpoint_metadata)
+        checkpoint_path = 'checkpoints/epoch' + str(epoch) + '.pt'
+        save_checkpoint_bundle(checkpoint_path, model.state_dict(), checkpoint_metadata)
+        checkpoint_paths.append(checkpoint_path)
         if val_loss < best_loss:
             best_loss = val_loss
             save_checkpoint_bundle(model_name, model.state_dict(), checkpoint_metadata)
@@ -618,6 +633,10 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
               "BestPredRatio {9}, BestThreshold {10:.4f}, BestTargets@FDR<=1% {11}, BestValFDR {12:.4%} Time: {13} "
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
                          val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, best_target_count, best_val_fdr, time_dif))
+
+    print("Best model path: " + model_name)
+    for checkpoint_path in checkpoint_paths:
+        test_model(model, test_data, device, checkpoint_path)
 
 
 

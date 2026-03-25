@@ -416,7 +416,7 @@ def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
     val_groups = {groups[i] for i in val_idx}
     test_groups = {groups[i] for i in test_idx}
     print(
-        "[split] grouped by peptide+charge; "
+        "[split] grouped by peptide; "
         f"total_groups={len(group_to_indices)} "
         f"train_groups={len(train_groups)} val_groups={len(val_groups)} test_groups={len(test_groups)}"
     )
@@ -564,8 +564,20 @@ def evaluate(data, model, loss, device, eval_batch_size):
 
 
 
+def _format_checkpoint_label(model_path):
+    base_name = os.path.basename(model_path)
+    stem, _ = os.path.splitext(base_name)
+    if stem.startswith("epoch"):
+        epoch_text = stem[len("epoch"):]
+        if epoch_text.isdigit():
+            return f"{base_name} (Epoch {int(epoch_text) + 1})"
+    return base_name
+
+
 def test_model(model, test_data, device, model_str, eval_batch_size):
     print("Testing...")
+    print("Checkpoint: " + _format_checkpoint_label(model_str))
+    print("Checkpoint path: " + os.path.abspath(model_str))
     model.eval()
     start_time = time.time()
     test_loader = Data.DataLoader(test_data, batch_size=eval_batch_size)
@@ -703,6 +715,7 @@ def train_model(
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
                          val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, epoch_best_target_count, best_val_fdr, time_dif))
 
+    print("Best model path: " + model_output_path)
     for checkpoint_path in checkpoint_paths:
         test_model(model, test_data, device, checkpoint_path, eval_batch_size)
 
