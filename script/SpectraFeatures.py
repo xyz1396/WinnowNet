@@ -780,13 +780,82 @@ def _iter_feature_keys(theory_dict, feature_dict_map, scan_map):
             yield key
 
 
+def _split_path_arg(value):
+    if value is None:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _default_base_from_tsv(tsv_file):
+    directory = os.path.dirname(os.path.abspath(tsv_file))
+    name = os.path.basename(tsv_file)
+    suffix = "_filtered_psms.tsv"
+    if name.endswith(suffix):
+        stem = name[: -len(suffix)]
+    else:
+        stem = os.path.splitext(name)[0]
+    return os.path.join(directory, stem)
+
+
+def _collect_tsvs_from_directory(directory):
+    matches = []
+    for root, _, files in os.walk(directory):
+        for file_name in sorted(files):
+            if file_name.endswith("_filtered_psms.tsv"):
+                matches.append(os.path.join(root, file_name))
+    return matches
+
+
+def _resolve_batch_tasks(input_value):
+    items = _split_path_arg(input_value)
+    if not items:
+        return []
+
+    any_directory = any(os.path.isdir(item) for item in items)
+    batch_mode = any_directory or len(items) > 1
+    if not batch_mode:
+        return []
+
+    tasks = []
+    seen = set()
+    for item in items:
+        if os.path.isdir(item):
+            tsv_files = _collect_tsvs_from_directory(item)
+            if not tsv_files:
+                raise ValueError(f"No *_filtered_psms.tsv files found under {item}.")
+        else:
+            tsv_files = [item]
+        for tsv_file in tsv_files:
+            tsv_path = os.path.abspath(tsv_file)
+            if tsv_path in seen:
+                continue
+            seen.add(tsv_path)
+            base_path = _default_base_from_tsv(tsv_path)
+            ft1_path = base_path + ".FT1"
+            ft2_path = base_path + ".FT2"
+            if not os.path.isfile(ft1_path):
+                raise FileNotFoundError(f"Missing FT1 file for {tsv_path}: {ft1_path}")
+            if not os.path.isfile(ft2_path):
+                raise FileNotFoundError(f"Missing FT2 file for {tsv_path}: {ft2_path}")
+            tasks.append(
+                {
+                    "tsv": tsv_path,
+                    "ft1": ft1_path,
+                    "ft2": ft2_path,
+                    "output": base_path + ".pkl",
+                }
+            )
+    return tasks
+
+
 def print_usage():
     print("\n\nUsage:\n")
-    print("-i\t tab delimited PSM file\n")
-    print("-1\t FT1 file\n")
-    print("-2\t FT2 file\n")
-    print("-o\t Spectrum features output file\n")
-    print("-t\t Number of threads\n")
+    print("-i\t tab delimited PSM file, a directory, or a comma-separated list of files/directories\n")
+    print("-1\t FT1 file (single-file mode only)\n")
+    print("-2\t FT2 file (single-file mode only)\n")
+    print("-o\t Spectrum features output file (single-file mode only)\n")
+    print("-t\t Number of threads per conversion\n")
+    print("-j\t Number of file conversions to run in parallel for directory/list input (default 1)\n")
     print("-f\t Attention mode or CNN mode\n")
     print("-c\t Sipros config file for theoretical spectra generator")
     print("-b\t SIP abundance percentage passed to sipros_theoretical_spectra")
@@ -798,91 +867,26 @@ def print_usage():
     print("MS2IsotopicAbundances is required unless -b/--sip-abundance is provided.")
 
 
-def main(argv=None):
-    global diffDa
-    global pairmaxlength
-    if argv is None:
-        argv = sys.argv[1:]
-    argv = normalize_long_flag_aliases(
-        argv,
-        {
-            "-max-peaks": "--max-peaks",
-            "-sip-abundance": "--sip-abundance",
-        },
-    )
-    argv = _normalize_sip_abundance_args(argv)
-    try:
-        opts, _ = getopt.getopt(argv, "hi:1:2:o:t:f:c:w:d:n:", ["max-peaks=", "sip-abundance="])
-    except Exception:
-        print("Error Option, using -h for help information.")
-        return 1
-    if len(opts) == 0:
-        print_usage()
-        return 1
+def _run_single_conversion(
+    tsv_file,
+    ft1_file,
+    ft2_file,
+    output_file,
+    config_file,
+    num_cpus,
+    mode,
+    sip_abundance,
+    ms1_isolation_window_mz,
+    fragment_env_top_n,
+):
     start_time = time.time()
-    ft1_file = ""
-    ft2_file = ""
-    tsv_file = ""
-    theoretical_file = ""
-    output_file = ""
-    mode = ""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_config_file = os.path.join(script_dir, "SIP.cfg")
-    config_file = default_config_file if os.path.exists(default_config_file) else "SiprosConfig.cfg"
-    num_cpus = str(os.cpu_count() or 1)
-    ms1_isolation_window_mz = 10.0
-    fragment_env_top_n = 3
-    sip_abundance = ""
-    pairmaxlength = DEFAULT_MAX_PEAKS
-    for opt, arg in opts:
-        if opt in ("-h"):
-            print_usage()
-            return 1
-        elif opt in ("-i"):
-            tsv_file = arg
-        elif opt in ("-1"):
-            ft1_file = arg
-        elif opt in ("-2"):
-            ft2_file = arg
-        elif opt in ("-o"):
-            output_file = arg
-        elif opt in ("-t"):
-            num_cpus = arg
-        elif opt in ("-f"):
-            mode = arg
-        elif opt in ("-c"):
-            config_file = arg
-        elif opt in ("-b", "--sip-abundance"):
-            sip_abundance = str(arg).strip()
-        elif opt in ("-w"):
-            ms1_isolation_window_mz = max(0.0, _to_float(arg, 10.0))
-        elif opt in ("-d"):
-            diffDa = max(0.0, _to_float(arg, 0.01))
-        elif opt in ("-n"):
-            fragment_env_top_n = max(1, int(_to_float(arg, 3)))
-        elif opt == "--max-peaks":
-            pairmaxlength = max(1, int(_to_float(arg, DEFAULT_MAX_PEAKS)))
-
-    if len(ft2_file) == 0 or len(ft1_file) == 0:
-        raise ValueError("Both FT1 and FT2 files are required. Use -1 and -2.")
-
-    if len(mode) == 0:
-        mode = "att"
-
-    if mode == "cnn":
-        print("Max peaks kept for CNN features: " + str(pairmaxlength))
-
-    if len(tsv_file) == 0:
-        raise ValueError("A tab delimited PSM file is required. Use -i.")
-    if len(output_file) == 0:
-        raise ValueError("An output pickle path is required. Use -o.")
-
     output_dir = os.path.dirname(os.path.abspath(output_file))
     os.makedirs(output_dir, exist_ok=True)
     output_base_name = os.path.splitext(os.path.basename(output_file))[0]
     theoretical_base_name = output_base_name or os.path.splitext(os.path.basename(tsv_file))[0]
     theoretical_file = os.path.join(output_dir, theoretical_base_name + ".theory.txt")
 
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     theoretical_bin = os.path.join(script_dir, "sipros_theoretical_spectra")
     if not os.path.isfile(theoretical_bin):
         raise FileNotFoundError(
@@ -891,7 +895,7 @@ def main(argv=None):
 
     D_exp_ms1 = FTtoDict(ft1_file, reduce_peak_charge_to_one=False)
     D_exp_ms2 = FTtoDict(ft2_file, reduce_peak_charge_to_one=True)
-    print('Experimental spectra loaded (FT1 + FT2)!')
+    print("Experimental spectra loaded (FT1 + FT2)!")
 
     psm_dict = dict()
     psm_scan_map, table_meta, row_records, row_stats = read_tsv(tsv_file, psm_dict, D_exp_ms2)
@@ -922,11 +926,11 @@ def main(argv=None):
     subprocess.run(cmd, check=True)
 
     D_theory = theoryToDict(theoretical_file)
-    print('Theoretical features loaded!')
+    print("Theoretical features loaded!")
     for psm in psm_dict:
         psm_dict[psm].get_features()
     D_feature = feature_dict(psm_dict)
-    print('Additional features loaded!')
+    print("Additional features loaded!")
 
     worker_count = max(1, int(_to_float(num_cpus, 1)))
     feature_payload = {}
@@ -972,7 +976,7 @@ def main(argv=None):
                 if model_input is not None:
                     feature_payload[feature_key] = model_input
 
-    print('Features generated!')
+    print("Features generated!")
     if os.path.exists(theoretical_file):
         os.remove(theoretical_file)
 
@@ -1008,10 +1012,244 @@ def main(argv=None):
         f"feature_keys={len(feature_payload)} "
         f"mode={mode}"
     )
-    with open(output_file, 'wb') as f:
+    with open(output_file, "wb") as f:
         pickle.dump(final_payload, f)
-    print('time:' + str(time.time() - start_time))
+    print("time:" + str(time.time() - start_time))
     return 0
+
+
+def _build_child_command(
+    script_path,
+    task,
+    config_file,
+    num_cpus,
+    mode,
+    sip_abundance,
+    ms1_isolation_window_mz,
+    diff_da,
+    fragment_env_top_n,
+    max_peaks,
+):
+    cmd = [
+        sys.executable,
+        script_path,
+        "-i",
+        task["tsv"],
+        "-1",
+        task["ft1"],
+        "-2",
+        task["ft2"],
+        "-o",
+        task["output"],
+        "-t",
+        str(num_cpus),
+        "-f",
+        mode,
+        "-c",
+        config_file,
+        "-w",
+        str(ms1_isolation_window_mz),
+        "-d",
+        str(diff_da),
+        "-n",
+        str(fragment_env_top_n),
+        "--max-peaks",
+        str(max_peaks),
+    ]
+    if sip_abundance:
+        cmd.extend(["-b", sip_abundance])
+    return cmd
+
+
+def _run_batch_conversions(
+    tasks,
+    batch_jobs,
+    config_file,
+    num_cpus,
+    mode,
+    sip_abundance,
+    ms1_isolation_window_mz,
+    diff_da,
+    fragment_env_top_n,
+    max_peaks,
+):
+    script_path = os.path.abspath(__file__)
+    max_parallel = max(1, int(_to_float(batch_jobs, 1)))
+    pending = list(tasks)
+    active = []
+    print(
+        f"Batch mode: files={len(tasks)} parallel_jobs={max_parallel} "
+        f"threads_per_job={num_cpus} mode={mode}"
+    )
+
+    while pending or active:
+        while pending and len(active) < max_parallel:
+            task = pending.pop(0)
+            print(
+                f"[batch:start] input={task['tsv']} "
+                f"output={task['output']}"
+            )
+            proc = subprocess.Popen(
+                _build_child_command(
+                    script_path,
+                    task,
+                    config_file,
+                    num_cpus,
+                    mode,
+                    sip_abundance,
+                    ms1_isolation_window_mz,
+                    diff_da,
+                    fragment_env_top_n,
+                    max_peaks,
+                )
+            )
+            active.append((task, proc))
+
+        if not active:
+            continue
+
+        time.sleep(0.2)
+        still_active = []
+        failed = None
+        for task, proc in active:
+            return_code = proc.poll()
+            if return_code is None:
+                still_active.append((task, proc))
+                continue
+            if return_code != 0:
+                failed = (task, return_code)
+                break
+            print(f"[batch:done] output={task['output']}")
+        if failed is not None:
+            failed_task, failed_code = failed
+            for task, proc in still_active:
+                proc.terminate()
+            for task, proc in still_active:
+                proc.wait()
+            raise RuntimeError(
+                f"Batch conversion failed for {failed_task['tsv']} with exit code {failed_code}."
+            )
+        active = still_active
+
+    print("Batch conversion complete.")
+    return 0
+
+
+def main(argv=None):
+    global diffDa
+    global pairmaxlength
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = normalize_long_flag_aliases(
+        argv,
+        {
+            "-max-peaks": "--max-peaks",
+            "-jobs": "--jobs",
+            "-sip-abundance": "--sip-abundance",
+        },
+    )
+    argv = _normalize_sip_abundance_args(argv)
+    try:
+        opts, _ = getopt.getopt(
+            argv,
+            "hi:1:2:o:t:j:f:c:w:d:n:",
+            ["max-peaks=", "jobs=", "sip-abundance="],
+        )
+    except Exception:
+        print("Error Option, using -h for help information.")
+        return 1
+    if len(opts) == 0:
+        print_usage()
+        return 1
+    ft1_file = ""
+    ft2_file = ""
+    tsv_file = ""
+    output_file = ""
+    mode = ""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_config_file = os.path.join(script_dir, "SIP.cfg")
+    config_file = default_config_file if os.path.exists(default_config_file) else "SiprosConfig.cfg"
+    num_cpus = str(os.cpu_count() or 1)
+    batch_jobs = 1
+    ms1_isolation_window_mz = 10.0
+    fragment_env_top_n = 3
+    sip_abundance = ""
+    pairmaxlength = DEFAULT_MAX_PEAKS
+    for opt, arg in opts:
+        if opt in ("-h"):
+            print_usage()
+            return 1
+        elif opt in ("-i"):
+            tsv_file = arg
+        elif opt in ("-1"):
+            ft1_file = arg
+        elif opt in ("-2"):
+            ft2_file = arg
+        elif opt in ("-o"):
+            output_file = arg
+        elif opt in ("-t"):
+            num_cpus = arg
+        elif opt in ("-j", "--jobs"):
+            batch_jobs = max(1, int(_to_float(arg, 1)))
+        elif opt in ("-f"):
+            mode = arg
+        elif opt in ("-c"):
+            config_file = arg
+        elif opt in ("-b", "--sip-abundance"):
+            sip_abundance = str(arg).strip()
+        elif opt in ("-w"):
+            ms1_isolation_window_mz = max(0.0, _to_float(arg, 10.0))
+        elif opt in ("-d"):
+            diffDa = max(0.0, _to_float(arg, 0.01))
+        elif opt in ("-n"):
+            fragment_env_top_n = max(1, int(_to_float(arg, 3)))
+        elif opt == "--max-peaks":
+            pairmaxlength = max(1, int(_to_float(arg, DEFAULT_MAX_PEAKS)))
+
+    if len(mode) == 0:
+        mode = "att"
+
+    if mode == "cnn":
+        print("Max peaks kept for CNN features: " + str(pairmaxlength))
+
+    if len(tsv_file) == 0:
+        raise ValueError("A tab delimited PSM file is required. Use -i.")
+    batch_tasks = _resolve_batch_tasks(tsv_file)
+    if batch_tasks:
+        if ft1_file or ft2_file or output_file:
+            raise ValueError(
+                "Directory/list input auto-resolves FT1/FT2/output paths; do not pass -1, -2, or -o."
+            )
+        return _run_batch_conversions(
+            batch_tasks,
+            batch_jobs,
+            config_file,
+            num_cpus,
+            mode,
+            sip_abundance,
+            ms1_isolation_window_mz,
+            diffDa,
+            fragment_env_top_n,
+            pairmaxlength,
+        )
+
+    if len(ft2_file) == 0 or len(ft1_file) == 0:
+        raise ValueError("Both FT1 and FT2 files are required. Use -1 and -2.")
+    if len(output_file) == 0:
+        raise ValueError("An output pickle path is required. Use -o.")
+
+    return _run_single_conversion(
+        tsv_file,
+        ft1_file,
+        ft2_file,
+        output_file,
+        config_file,
+        num_cpus,
+        mode,
+        sip_abundance,
+        ms1_isolation_window_mz,
+        fragment_env_top_n,
+    )
 
 
 if __name__ == "__main__":

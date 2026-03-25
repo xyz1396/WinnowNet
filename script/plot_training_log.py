@@ -5,14 +5,21 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
+FLOAT_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 EPOCH_PATTERN = re.compile(
     r"Epoch\s+(\d+),\s+"
-    r"Train_loss:\s+([0-9.]+),\s+Train_acc\s+([0-9.]+)%,\s+"
-    r"Train_Posprec\s+([0-9.]+)%,\s+Train_Negprec\s+([0-9.]+)%,\s+"
-    r"Val_loss:\s+([0-9.]+),\s+Val_acc\s+([0-9.]+)%,\s*"
-    r"Val_Posprec\s+([0-9.]+)%,\s+Val_Negprec\s+([0-9.]+)%,\s+"
-    r"BestPredRatio\s+1:([0-9.]+),\s+BestThreshold\s+([0-9.]+),\s+"
-    r"BestTargets@FDR<=1%\s+(\d+),\s+BestValFDR\s+([0-9.]+)%",
+    rf"Train_loss:\s*({FLOAT_PATTERN}),\s*Train_acc\s*({FLOAT_PATTERN})%,\s*"
+    rf"Train_Posprec\s*({FLOAT_PATTERN})%,\s*Train_Negprec\s*({FLOAT_PATTERN})%,\s*"
+    rf"Val_loss:\s*({FLOAT_PATTERN}),\s*Val_acc\s*({FLOAT_PATTERN})%,\s*"
+    rf"Val_Posprec\s*({FLOAT_PATTERN})%,\s*Val_Negprec\s*({FLOAT_PATTERN})%,\s*"
+    rf"BestPredRatio\s*1:({FLOAT_PATTERN}),\s*BestThreshold\s*({FLOAT_PATTERN}),\s*"
+    rf"BestTargets@FDR<=1%\s*(\d+),\s*BestValFDR\s*({FLOAT_PATTERN})%"
+)
+TEST_PATTERN = re.compile(
+    rf"Checkpoint:\s+epoch(\d+)\.pt\s+\(Epoch\s+(\d+)\)\s+"
+    rf"Checkpoint path:\s+.+?\s+"
+    rf"Test accuracy:\s*({FLOAT_PATTERN})%,\s*F1-Score:\s*({FLOAT_PATTERN})%",
+    re.DOTALL,
 )
 
 
@@ -47,6 +54,20 @@ def load_rows(log_path):
         )
     if not rows:
         raise ValueError("No epoch lines matched the WinnowNet log format.")
+
+    test_rows = {}
+    for match in TEST_PATTERN.finditer(text):
+        epoch = int(match.group(2))
+        checkpoint_epoch = int(match.group(1)) + 1
+        if epoch != checkpoint_epoch:
+            continue
+        test_rows[epoch] = {
+            "test_acc": float(match.group(3)),
+            "test_f1": float(match.group(4)),
+        }
+
+    for row in rows:
+        row.update(test_rows.get(row["epoch"], {}))
     return rows
 
 
@@ -60,18 +81,27 @@ def plot_rows(rows, output_path, title):
     val_acc = [row["val_acc"] for row in rows]
     best_threshold = [row["best_threshold"] for row in rows]
     best_pred_ratio = [row["best_pred_ratio"] for row in rows]
+    has_test_metrics = any("test_acc" in row for row in rows)
+    test_acc = [row.get("test_acc") for row in rows]
+    test_f1 = [row.get("test_f1") for row in rows]
 
     best_target_idx = max(range(len(rows)), key=lambda idx: best_targets[idx])
     min_val_loss_idx = min(range(len(rows)), key=lambda idx: val_loss[idx])
+    best_test_f1_idx = None
+    if has_test_metrics:
+        best_test_f1_idx = max(
+            (idx for idx, value in enumerate(test_f1) if value is not None),
+            key=lambda idx: test_f1[idx],
+        )
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+    fig, axes = plt.subplots(4, 2, figsize=(14, 15), constrained_layout=True)
 
     ax = axes[0, 0]
     ax.plot(epochs, train_loss, label="Train", color="#2563eb", linewidth=2)
     ax.plot(epochs, val_loss, label="Val", color="#ea580c", linewidth=2)
     ax.scatter([epochs[min_val_loss_idx]], [val_loss[min_val_loss_idx]], color="#dc2626", zorder=3)
     ax.annotate(
-        f"min val_loss: e{epochs[min_val_loss_idx]} = {val_loss[min_val_loss_idx]:.3f}",
+        f"min val_loss: e{epochs[min_val_loss_idx]} = {val_loss[min_val_loss_idx]:.3g}",
         (epochs[min_val_loss_idx], val_loss[min_val_loss_idx]),
         textcoords="offset points",
         xytext=(8, 8),
@@ -86,6 +116,8 @@ def plot_rows(rows, output_path, title):
     ax = axes[0, 1]
     ax.plot(epochs, train_acc, label="Train", color="#16a34a", linewidth=2)
     ax.plot(epochs, val_acc, label="Val", color="#ca8a04", linewidth=2)
+    if has_test_metrics:
+        ax.plot(epochs, test_acc, label="Test", color="#7c3aed", linewidth=2, alpha=0.9)
     ax.set_title("Accuracy")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Accuracy (%)")
@@ -130,6 +162,34 @@ def plot_rows(rows, output_path, title):
     ax.set_ylabel("x")
     ax.grid(True, alpha=0.25)
 
+    ax = axes[3, 0]
+    if has_test_metrics:
+        ax.plot(epochs, test_f1, color="#0f766e", linewidth=2)
+        ax.scatter([epochs[best_test_f1_idx]], [test_f1[best_test_f1_idx]], color="#dc2626", zorder=3)
+        ax.annotate(
+            f"best test F1: e{epochs[best_test_f1_idx]} = {test_f1[best_test_f1_idx]:.2f}%",
+            (epochs[best_test_f1_idx], test_f1[best_test_f1_idx]),
+            textcoords="offset points",
+            xytext=(8, 8),
+            fontsize=9,
+        )
+    else:
+        ax.text(0.5, 0.5, "No per-checkpoint test metrics in log", ha="center", va="center")
+    ax.set_title("Test F1")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("F1 (%)" if has_test_metrics else "")
+    ax.grid(True, alpha=0.25)
+
+    ax = axes[3, 1]
+    if has_test_metrics:
+        ax.plot(epochs, test_acc, color="#be123c", linewidth=2)
+    else:
+        ax.text(0.5, 0.5, "No per-checkpoint test metrics in log", ha="center", va="center")
+    ax.set_title("Test Accuracy")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy (%)" if has_test_metrics else "")
+    ax.grid(True, alpha=0.25)
+
     fig.suptitle(title, fontsize=15)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
 
@@ -147,7 +207,7 @@ def main():
     print(f"epochs={len(rows)}")
     print(
         f"min_val_loss_epoch={min_val_loss_row['epoch']} "
-        f"min_val_loss={min_val_loss_row['val_loss']:.4f}"
+        f"min_val_loss={min_val_loss_row['val_loss']:.4g}"
     )
     print(
         f"best_targets_epoch={best_target_row['epoch']} "
@@ -156,6 +216,14 @@ def main():
         f"best_pred_ratio=1:{best_target_row['best_pred_ratio']:.4f} "
         f"best_val_fdr={best_target_row['best_val_fdr']:.4f}%"
     )
+    test_rows = [row for row in rows if "test_f1" in row]
+    if test_rows:
+        best_test_row = max(test_rows, key=lambda row: row["test_f1"])
+        print(
+            f"best_test_epoch={best_test_row['epoch']} "
+            f"test_acc={best_test_row['test_acc']:.2f}% "
+            f"test_f1={best_test_row['test_f1']:.2f}%"
+        )
 
 
 if __name__ == "__main__":
