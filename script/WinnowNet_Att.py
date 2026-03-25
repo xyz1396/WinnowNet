@@ -25,6 +25,7 @@ from checkpoint_utils import (
 )
 from pkl_utils import (
     expand_pickle_inputs,
+    get_entry_group_key,
     get_entry_label,
     get_entry_label_confidence,
     get_entry_model_input,
@@ -255,6 +256,7 @@ def _select_best_prediction_defaults(y_true, y_scores, train_decoy_per_target):
 def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset"):
     L = []
     Yweight = []
+    groups = []
     positive = 0
     negative = 0
     total_rows = 0
@@ -269,13 +271,16 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
         file_kept_rows = 0
         file_skipped_non_one = 0
         file_unlabeled_rows = 0
-        _, entries = load_feature_pickle(feature_path)
-        for _, entry in entries.items():
+        file_groups = set()
+        meta, entries = load_feature_pickle(feature_path)
+        for record_key, entry in entries.items():
             total_rows += 1
             file_total_rows += 1
             model_input = get_entry_model_input(entry)
             if model_input is None:
                 continue
+            psm_id = entry.get("psm_id", record_key) if isinstance(entry, dict) else record_key
+            group_key = get_entry_group_key(meta, psm_id, entry)
 
             if force_label is None:
                 label = get_entry_label(entry)
@@ -299,6 +304,8 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
                 if confidence > threshold:
                     L.append(model_input)
                     Yweight.append([1, 1])
+                    groups.append(group_key)
+                    file_groups.add(group_key)
                     positive += 1
                     file_positive += 1
                     kept_rows += 1
@@ -306,6 +313,8 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             else:
                 L.append(model_input)
                 Yweight.append([0, confidence])
+                groups.append(group_key)
+                file_groups.add(group_key)
                 negative += 1
                 file_negative += 1
                 kept_rows += 1
@@ -314,6 +323,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
         print(
             f"[{dataset_name}:file] path={os.path.abspath(feature_path)} "
             f"kept_psms={file_kept_rows} kept_targets={file_positive} kept_decoys={file_negative} "
+            f"unique_groups={len(file_groups)} "
             f"total_rows={file_total_rows} unlabeled_rows={file_unlabeled_rows} "
             f"skipped_label_not_1={file_skipped_non_one}"
         )
@@ -323,7 +333,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
         f"total_rows={total_rows} kept_rows={kept_rows} "
         f"unlabeled_rows={unlabeled_rows} skipped_label_not_1={skipped_non_one}"
     )
-    return L, Yweight
+    return L, Yweight, groups
 
 
 def _collect_pickles_from_directory(directory):
@@ -366,19 +376,50 @@ def pad_control(data,pairmaxlength):
     return np.asarray(data,dtype=float)
 
 
-def split_list(X, Yweight, val_ratio=0.1, test_ratio=0.1, seed=10):
+def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
+    if not (len(X) == len(Yweight) == len(groups)):
+        raise ValueError("Grouped split requires X, Yweight, and groups to have the same length.")
+
     n = len(X)
-    idx = np.arange(n)
+    group_to_indices = {}
+    for idx, group_key in enumerate(groups):
+        group_to_indices.setdefault(group_key, []).append(idx)
+
+    group_keys = list(group_to_indices.keys())
     rng = np.random.RandomState(seed)
-    rng.shuffle(idx)
+    rng.shuffle(group_keys)
+
     test_n = max(1, int(n * test_ratio)) if n >= 10 else max(0, n // 5)
     val_n = max(1, int(n * val_ratio)) if n - test_n >= 10 else max(0, (n - test_n) // 5)
-    test_idx = idx[:test_n]
-    val_idx = idx[test_n:test_n + val_n]
-    train_idx = idx[test_n + val_n:]
+
+    test_idx = []
+    val_idx = []
+    train_idx = []
+    test_count = 0
+    val_count = 0
+
+    for group_key in group_keys:
+        indices = group_to_indices[group_key]
+        if test_count < test_n:
+            test_idx.extend(indices)
+            test_count += len(indices)
+        elif val_count < val_n:
+            val_idx.extend(indices)
+            val_count += len(indices)
+        else:
+            train_idx.extend(indices)
 
     def _pick(indices):
         return [X[i] for i in indices], [Yweight[i] for i in indices]
+
+    train_groups = {groups[i] for i in train_idx}
+    val_groups = {groups[i] for i in val_idx}
+    test_groups = {groups[i] for i in test_idx}
+    print(
+        "[split] grouped by peptide+charge; "
+        f"total_groups={len(group_to_indices)} "
+        f"train_groups={len(train_groups)} val_groups={len(val_groups)} test_groups={len(test_groups)}"
+    )
 
     return _pick(train_idx), _pick(val_idx), _pick(test_idx)
 
@@ -412,8 +453,7 @@ class my_loss(torch.nn.Module):
         weight_label = weight_label.float()
         entropy = -F.log_softmax(outputs, dim=1)
         w_entropy = weight_label * entropy[:, 1] + (1 - weight_label) * entropy[:, 0]
-        losssum = torch.sum(w_entropy)
-        return losssum
+        return torch.mean(w_entropy)
 
 
 class MS2Encoder(nn.Module):
@@ -761,22 +801,17 @@ if __name__ == "__main__":
     if split_mode:
         if len(target_pickles) == 0 or len(decoy_pickles) == 0:
             raise ValueError("Missing target/decoy pickle inputs.")
-        X_pos, y_pos = _load_feature_records(target_pickles, force_label=1, dataset_name="target")
-        X_neg, y_neg = _load_feature_records(decoy_pickles, force_label=0, dataset_name="decoy")
-        (X_train_pos, y_train_pos), (X_val_pos, y_val_pos), (X_test_pos, y_test_pos) = split_list(X_pos, y_pos)
-        (X_train_neg, y_train_neg), (X_val_neg, y_val_neg), (X_test_neg, y_test_neg) = split_list(X_neg, y_neg)
-
-        X_train = X_train_pos + X_train_neg
-        yweight_train = y_train_pos + y_train_neg
-        X_val = X_val_pos + X_val_neg
-        yweight_val = y_val_pos + y_val_neg
-        X_test = X_test_pos + X_test_neg
-        yweight_test = y_test_pos + y_test_neg
+        X_pos, y_pos, group_pos = _load_feature_records(target_pickles, force_label=1, dataset_name="target")
+        X_neg, y_neg, group_neg = _load_feature_records(decoy_pickles, force_label=0, dataset_name="decoy")
+        X_all = X_pos + X_neg
+        y_all = y_pos + y_neg
+        group_all = group_pos + group_neg
+        (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_grouped(X_all, y_all, group_all)
     else:
         if len(target_pickles) == 0:
             raise ValueError(f"No feature pickles found under {input_directory}.")
-        L, Yweight = _load_feature_records(target_pickles, dataset_name="embedded")
-        (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_list(L, Yweight)
+        L, Yweight, groups = _load_feature_records(target_pickles, dataset_name="embedded")
+        (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_grouped(L, Yweight, groups)
 
     X_train, yweight_train, effective_train_decoy_ratio = _apply_target_decoy_ratio(
         X_train,

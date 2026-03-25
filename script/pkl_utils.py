@@ -1,6 +1,7 @@
 import glob
 import os
 import pickle
+import re
 
 
 PKL_META_KEY = "__meta__"
@@ -116,6 +117,34 @@ def get_entry_row_map(meta, psm_id, entry):
     elif "PSMId" not in row_map and "SpecId" not in row_map:
         row_map["PSMId"] = psm_id
     return row_map
+
+
+def canonicalize_peptide_sequence(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\[(.*)\]", text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def get_entry_group_key(meta, psm_id, entry):
+    if not is_rich_entry(entry):
+        return str(psm_id)
+
+    row_map = get_entry_row_map(meta, psm_id, entry)
+
+    peptide_value = ""
+    for column in ["Peptide", "IdentifiedPeptide", "OriginalPeptide"]:
+        peptide_value = str(row_map.get(column, "")).strip()
+        if peptide_value:
+            break
+
+    peptide_core = canonicalize_peptide_sequence(peptide_value)
+    if peptide_core:
+        return peptide_core
+    return str(psm_id)
 
 
 def choose_output_column(columns, preferred_names, default_name):
