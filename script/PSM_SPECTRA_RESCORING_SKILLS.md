@@ -113,18 +113,20 @@ Used when `-f cnn`.
 
 Matching process:
 1. Match MS1 peaks against theoretical precursor peaks.
-2. Match MS2 peaks against theoretical fragment peaks.
-3. Fragment peaks are first filtered by envelope metadata:
+2. Trim theoretical fragment peaks to the observed experimental MS2 m/z range.
+3. Match MS2 peaks against the trimmed theoretical fragment peaks.
+4. Fragment peaks are first filtered by envelope metadata:
 - group by `(fragment_kind, fragment_position)`
 - keep top `n` by theoretical intensity in each group (`-n`, default `3`)
-4. If no matches found, fallback match against filtered `theory_all`.
 
 Each match yields one triplet feature:
 - `[delta_mz, experimental_intensity, theoretical_intensity]`
 
 Post-processing:
 - pad/truncate to `pairmaxlength=500`
-- z-score normalize intensity channels (columns 2 and 3 of triplet)
+- normalize precursor matches within the precursor group
+- normalize fragment matches within each `(fragment_kind, fragment_position)` group
+  for experimental and theoretical channels
 - transpose to shape `[3, pairmaxlength]`
 
 Output entry in feature pickle (CNN path):
@@ -140,8 +142,13 @@ Used when `-f att`.
 Process:
 1. Filter MS1 peaks by user-defined isolation window `-w`, centered on most abundant theoretical precursor m/z.
 2. Build `exp_all = filtered_ms1 + ms2`.
-3. Use theoretical `all` as `theory_all`.
-4. Standardize intensity separately for experimental and theoretical sets.
+3. Trim theoretical fragment peaks to the observed experimental MS2 m/z range.
+4. Keep precursor and fragment groups separate during normalization.
+5. Normalize precursor intensities as one precursor group.
+6. Normalize theoretical fragment intensities within each
+   `(fragment_kind, fragment_position)` group.
+7. Normalize experimental MS2 peaks as one fragment bucket.
+8. Concatenate normalized precursor and fragment peaks into the final arrays.
 
 Output entry in feature pickle (ATT path):
 - `[Xexp, Xtheory]`

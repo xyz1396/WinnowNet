@@ -8,7 +8,6 @@ import time
 from multiprocessing import get_all_start_methods, get_context
 
 import numpy as np
-from sklearn.preprocessing import StandardScaler
 from pkl_utils import PKL_META_KEY, PKL_SCHEMA_VERSION, normalize_long_flag_aliases
 
 DEFAULT_MAX_PEAKS = 300
@@ -228,23 +227,34 @@ def _compute_label_confidence(label, qvalue_raw):
 
 def FTtoDict(file_path, reduce_peak_charge_to_one=False):
     msdict = {}
+    resolved_file_path = os.path.abspath(file_path)
     scan_id = None
     charge = 0
     parent_scan = ""
     isolation_center_mz = 0.0
     precursor_candidates = []
     peaks = []
+    peak_metadata = []
 
     def _flush():
         if scan_id is None:
             return
         sorted_peaks = sorted(peaks, key=lambda x: x[0])
+        sorted_peak_metadata = [
+            metadata
+            for _, metadata in sorted(
+                zip(peaks, peak_metadata),
+                key=lambda item: item[0][0],
+            )
+        ]
         msdict[scan_id] = {
             "isolation_center_mz__charge": f"{isolation_center_mz}_{charge}",
             "peaks": sorted_peaks,
+            "peak_metadata": sorted_peak_metadata,
             "parent_scan": parent_scan,
             "isolation_center_mz": isolation_center_mz,
             "precursor_candidates": precursor_candidates.copy(),
+            "source_file": resolved_file_path,
         }
 
     with open(file_path) as fh:
@@ -265,6 +275,7 @@ def FTtoDict(file_path, reduce_peak_charge_to_one=False):
                     parent_scan = ""
                     precursor_candidates = []
                     peaks = []
+                    peak_metadata = []
                 elif tokens[0] == "Z" and scan_id is not None:
                     # FT2 Z-line format:
                     # Z <selected_z> <selected_z * isolation_center_mz> [<cand_z1> <cand_mz1> ...]
@@ -295,11 +306,19 @@ def FTtoDict(file_path, reduce_peak_charge_to_one=False):
             vals = line.split()
             if len(vals) >= 2:
                 mz = _to_float(vals[0])
+                raw_mz = mz
                 intensity = _to_float(vals[1])
                 peak_charge = int(_to_float(vals[5], 0)) if len(vals) >= 6 else 0
                 if reduce_peak_charge_to_one and peak_charge > 1:
                     mz = peak_charge * (mz - PROTON_MASS) + PROTON_MASS
                 peaks.append([mz, intensity])
+                peak_metadata.append(
+                    {
+                        "raw_mz": raw_mz,
+                        "raw_charge": peak_charge,
+                        "stored_mz": mz,
+                    }
+                )
     _flush()
     return msdict
 
@@ -427,6 +446,12 @@ def read_tsv(tsv_file, psm_dict, ms2_dict):
         if use_header:
             idx = (_get_field_value(row, field_lookup, ["PSMId", "SpecId"]) or "").strip()
             qvalue_raw = _get_field_value(row, field_lookup, ["q-value", "qvalue"], "")
+            exp_mass_raw = _get_field_value(
+                row,
+                field_lookup,
+                ["ExpMass", "ExperimentalMass", "expmass"],
+                "0",
+            )
             peptide_raw = _get_field_value(
                 row,
                 field_lookup,
@@ -465,6 +490,7 @@ def read_tsv(tsv_file, psm_dict, ms2_dict):
             if len(values) > 0 and "FT2" in values[0] and "FT2" not in idx:
                 idx = values[0]
             qvalue_raw = values[2] if len(values) > 2 else "0"
+            exp_mass_raw = "0"
             peptide_raw = values[4] if len(values) > 4 else (values[1] if len(values) > 1 else "")
             mass_error_raw = "0"
             isotopic_shift_raw = "0"
@@ -518,6 +544,7 @@ def read_tsv(tsv_file, psm_dict, ms2_dict):
             else:
                 charge = "2"
         charge_int = int(_to_float(charge, 0))
+        exp_mass = _to_float(exp_mass_raw, 0.0)
 
         qvalue = _to_float(qvalue_raw, 0.0)
         peptidestr = _clean_peptide(peptide_raw)
@@ -552,6 +579,8 @@ def read_tsv(tsv_file, psm_dict, ms2_dict):
             "ms2_scan": scannum,
             "ms1_scan": psm_dict[uniqueID].ms1_scan,
             "charge": charge_int,
+            "exp_mass": exp_mass,
+            "precursor_mass_charge1": exp_mass + PROTON_MASS if exp_mass > 0 else 0.0,
         }
     return psm_scan_map, table_meta, row_records, row_stats
 
@@ -590,50 +619,142 @@ def pad_control_3d(data):
     return data
 
 def _to_peak_array(peaks):
-    if not peaks:
+    if peaks is None:
         return np.empty((0, 2), dtype=float)
-    return np.asarray(peaks, dtype=float)
+    peak_array = np.asarray(peaks, dtype=float)
+    if peak_array.size == 0:
+        return np.empty((0, 2), dtype=float)
+    return peak_array
 
 
-def _append_matches(exp_array, theory_array, x_features):
+def _max_group_intensity(peaks):
+    peak_array = _to_peak_array(peaks)
+    if peak_array.shape[0] == 0:
+        return 0.0
+    intensities = np.maximum(peak_array[:, 1], 0.0)
+    if intensities.shape[0] == 0:
+        return 0.0
+    return float(np.max(intensities))
+
+
+def _normalize_peak_group(peaks):
+    peak_array = _to_peak_array(peaks)
+    if peak_array.shape[0] == 0:
+        return []
+    max_intensity = _max_group_intensity(peak_array)
+    normalized = peak_array.copy()
+    if max_intensity > 0:
+        normalized[:, 1] = np.maximum(normalized[:, 1], 0.0) / max_intensity
+    else:
+        normalized[:, 1] = 0.0
+    return normalized.tolist()
+
+
+def _fragment_group_key(kind, position, fallback_idx):
+    kind_text = str(kind or "").strip().lower()
+    position_value = int(_to_float(position, 0))
+    if kind_text and position_value > 0:
+        return (kind_text, position_value)
+    return ("fragment", int(fallback_idx))
+
+
+def _fragment_peak_entries(peaks, fragment_kinds, fragment_positions):
+    peak_array = _to_peak_array(peaks)
+    if peak_array.shape[0] == 0:
+        return []
+
+    entries = []
+    for idx, peak in enumerate(peak_array.tolist()):
+        kind = fragment_kinds[idx] if idx < len(fragment_kinds) else ""
+        position = fragment_positions[idx] if idx < len(fragment_positions) else 0
+        group_key = _fragment_group_key(kind, position, idx)
+        entries.append((peak, group_key))
+    return entries
+
+
+def _normalize_grouped_peak_entries(entries):
+    grouped = {}
+    for peak, group_key in entries:
+        grouped.setdefault(group_key, []).append(peak)
+
+    normalized_entries = []
+    for group_key, peaks in grouped.items():
+        for peak in _normalize_peak_group(peaks):
+            normalized_entries.append((peak, group_key))
+    normalized_entries.sort(key=lambda item: item[0][0])
+    return normalized_entries
+
+
+def _group_maxima_from_peak_entries(entries):
+    maxima = {}
+    for peak, group_key in entries:
+        intensity = max(0.0, float(peak[1]))
+        maxima[group_key] = max(maxima.get(group_key, 0.0), intensity)
+    return maxima
+
+
+def _group_maxima_from_matched_exp(x_features):
+    maxima = {}
+    for _, exp_intensity, _, exp_group, _ in x_features:
+        intensity = max(0.0, float(exp_intensity))
+        maxima[exp_group] = max(maxima.get(exp_group, 0.0), intensity)
+    return maxima
+
+
+def _append_matches(exp_array, theory_array, theory_groups, x_features, exp_group=None):
     if exp_array.shape[0] == 0 or theory_array.shape[0] == 0:
         return
-    for mz in theory_array:
+    for mz, theory_group in zip(theory_array, theory_groups):
         index = np.where(
             np.logical_and(exp_array[:, 0] > mz[0] - diffDa, exp_array[:, 0] < mz[0] + diffDa)
         )[0]
         if len(index) > 0:
+            exp_group_key = theory_group if exp_group is None else exp_group
             for idx in index:
-                x_features.append([exp_array[idx][0] - mz[0], exp_array[idx][1], mz[1]])
+                x_features.append(
+                    [exp_array[idx][0] - mz[0], exp_array[idx][1], mz[1], exp_group_key, theory_group]
+                )
+
+
+def _normalize_cnn_matches(x_features, exp_group_maxima, theory_group_maxima):
+    normalized = []
+    for delta_mz, exp_intensity, theory_intensity, exp_group, theory_group in x_features:
+        exp_max = float(exp_group_maxima.get(exp_group, 0.0))
+        theory_max = float(theory_group_maxima.get(theory_group, 0.0))
+        exp_value = max(0.0, float(exp_intensity))
+        theory_value = max(0.0, float(theory_intensity))
+        if exp_max > 0:
+            exp_value = exp_value / exp_max
+        else:
+            exp_value = 0.0
+        if theory_max > 0:
+            theory_value = theory_value / theory_max
+        else:
+            theory_value = 0.0
+        normalized.append([float(delta_mz), exp_value, theory_value])
+    return normalized
 
 
 def _select_fragment_peaks_for_cnn(Xtheory, top_n=3):
-    fragment = Xtheory.get("fragment", [])
-    if len(fragment) == 0:
+    entries = _fragment_peak_entries(
+        Xtheory.get("fragment", []),
+        Xtheory.get("fragment_kinds", []),
+        Xtheory.get("fragment_positions", []),
+    )
+    if len(entries) == 0:
         return []
     if top_n <= 0:
-        return sorted(fragment)
-
-    fragment_kinds = Xtheory.get("fragment_kinds", [])
-    fragment_positions = Xtheory.get("fragment_positions", [])
-    n_meta = min(len(fragment), len(fragment_kinds), len(fragment_positions))
-    if n_meta == 0:
-        return sorted(fragment)
+        return sorted(entries, key=lambda item: item[0][0])
 
     grouped = {}
-    for i in range(n_meta):
-        kind = str(fragment_kinds[i]).lower()
-        position = int(_to_float(fragment_positions[i], 0))
-        key = (kind, position)
-        grouped.setdefault(key, []).append(fragment[i])
+    for peak, group_key in entries:
+        grouped.setdefault(group_key, []).append(peak)
 
-    selected = []
-    for peaks in grouped.values():
-        selected.extend(sorted(peaks, key=lambda x: x[1], reverse=True)[:top_n])
-
-    if len(fragment) > n_meta:
-        selected.extend(fragment[n_meta:])
-    return sorted(selected)
+    grouped_selected = []
+    for group_key, peaks in grouped.items():
+        for peak in sorted(peaks, key=lambda x: x[1], reverse=True)[:top_n]:
+            grouped_selected.append((peak, group_key))
+    return sorted(grouped_selected, key=lambda item: item[0][0])
 
 
 def _filter_ms1_window(ms1_peaks, precursor_theory, isolation_window_mz=10.0):
@@ -648,6 +769,32 @@ def _filter_ms1_window(ms1_peaks, precursor_theory, isolation_window_mz=10.0):
     return [p for p in ms1_peaks if low <= p[0] <= high]
 
 
+def _filter_ms2_peaks_by_precursor_mass(ms2_record, psm_id, scan_id, exp_mass, precursor_mass_charge1):
+    peaks = ms2_record.get("peaks", [])
+    if precursor_mass_charge1 <= 0 or len(peaks) == 0:
+        return peaks, 0
+
+    filtered_peaks = []
+    removed_count = 0
+    for peak in peaks:
+        stored_mz = float(peak[0]) if len(peak) > 0 else 0.0
+        if stored_mz > precursor_mass_charge1:
+            removed_count += 1
+            continue
+        filtered_peaks.append(peak)
+    return filtered_peaks, removed_count
+
+
+def _trim_theory_to_exp_mz_range(exp_peaks, theory_peaks):
+    exp_array = _to_peak_array(exp_peaks)
+    theory_array = _to_peak_array(theory_peaks)
+    if exp_array.shape[0] == 0 or theory_array.shape[0] == 0:
+        return []
+    low = float(np.min(exp_array[:, 0]))
+    high = float(np.max(exp_array[:, 0]))
+    return theory_array[(theory_array[:, 0] >= low) & (theory_array[:, 0] <= high)].tolist()
+
+
 def IonExtract(
     ms1_peaks,
     ms2_peaks,
@@ -658,24 +805,25 @@ def IonExtract(
     ms1_array = _to_peak_array(ms1_peaks)
     ms2_array = _to_peak_array(ms2_peaks)
     precursor_peaks = Xtheory.get("precursor", [])
-    fragment_peaks = _select_fragment_peaks_for_cnn(Xtheory, fragment_top_n)
     theory_precursor = _to_peak_array(precursor_peaks)
-    theory_fragment = _to_peak_array(fragment_peaks)
-    theory_all = _to_peak_array(sorted(precursor_peaks + fragment_peaks))
+    precursor_groups = ["precursor"] * theory_precursor.shape[0]
+    trimmed_theory = dict(Xtheory)
+    trimmed_theory["fragment"] = _trim_theory_to_exp_mz_range(ms2_array, Xtheory.get("fragment", []))
+    fragment_entries = _select_fragment_peaks_for_cnn(trimmed_theory, fragment_top_n)
+    theory_fragment = _to_peak_array([peak for peak, _ in fragment_entries])
+    fragment_groups = [group_key for _, group_key in fragment_entries]
+    theory_group_maxima = {
+        "precursor": _max_group_intensity(theory_precursor),
+    }
+    theory_group_maxima.update(_group_maxima_from_peak_entries(fragment_entries))
 
     xFeatures = []
-    _append_matches(ms1_array, theory_precursor, xFeatures)
-    _append_matches(ms2_array, theory_fragment, xFeatures)
+    _append_matches(ms1_array, theory_precursor, precursor_groups, xFeatures, exp_group="precursor")
+    _append_matches(ms2_array, theory_fragment, fragment_groups, xFeatures, exp_group=None)
 
-    if len(xFeatures) == 0:
-        _append_matches(ms2_array, theory_all, xFeatures)
-
+    exp_group_maxima = _group_maxima_from_matched_exp(xFeatures)
+    xFeatures = _normalize_cnn_matches(xFeatures, exp_group_maxima, theory_group_maxima)
     xFeatures = np.asarray(pad_control_3d(xFeatures), dtype=float)
-
-    transformer = StandardScaler()
-    Norm = transformer.fit_transform(xFeatures)
-    xFeatures[:, 1] = Norm[:, 1]
-    xFeatures[:, 2] = Norm[:, 2]
     xFeatures = xFeatures.transpose()
     return [xFeatures, X_add_feature]
 
@@ -692,8 +840,19 @@ def IonExtract_Att(
         Xtheory.get("precursor", []),
         isolation_window_mz,
     )
-    exp_all = ms1_filtered + ms2_peaks
-    theory_all = Xtheory.get("all", [])
+    exp_precursor = _normalize_peak_group(ms1_filtered)
+    exp_fragment = _normalize_peak_group(ms2_peaks)
+    theory_precursor = _normalize_peak_group(Xtheory.get("precursor", []))
+    theory_fragment_entries = _fragment_peak_entries(
+        _trim_theory_to_exp_mz_range(ms2_peaks, Xtheory.get("fragment", [])),
+        Xtheory.get("fragment_kinds", []),
+        Xtheory.get("fragment_positions", []),
+    )
+    theory_fragment = [
+        peak for peak, _ in _normalize_grouped_peak_entries(theory_fragment_entries)
+    ]
+    exp_all = exp_precursor + exp_fragment
+    theory_all = sorted(theory_precursor + theory_fragment)
 
     if len(exp_all) == 0:
         exp_all = [[0.0, 0.0]]
@@ -702,12 +861,6 @@ def IonExtract_Att(
 
     Xexp = np.asarray(exp_all, dtype=float)
     Xtheory = np.asarray(theory_all, dtype=float)
-
-    transformer = StandardScaler()
-    Norm = transformer.fit_transform(Xexp)
-    Xexp[:, 1] = Norm[:, 1]
-    Norm = transformer.fit_transform(Xtheory)
-    Xtheory[:, 1] = Norm[:, 1]
     return [Xexp, Xtheory]
 
 
@@ -743,17 +896,24 @@ def _set_worker_state(
 def _extract_feature_for_key(key):
     scan_info = _WORKER_SCAN_MAP.get(key)
     if scan_info is None:
-        return key, None
+        return key, None, 0
 
     ms2_scan = scan_info["ms2_scan"]
     ms1_scan = scan_info["ms1_scan"]
-    ms2_peaks = _WORKER_EXP_MS2.get(ms2_scan, {}).get("peaks", [])
+    ms2_record = _WORKER_EXP_MS2.get(ms2_scan, {})
+    ms2_peaks, removed_peak_count = _filter_ms2_peaks_by_precursor_mass(
+        ms2_record,
+        key,
+        ms2_scan,
+        scan_info.get("exp_mass", 0.0),
+        scan_info.get("precursor_mass_charge1", 0.0),
+    )
     ms1_peaks = _WORKER_EXP_MS1.get(ms1_scan, {}).get("peaks", [])
     theory = _WORKER_THEORY.get(key)
     features = _WORKER_FEATURE.get(key)
 
     if theory is None or features is None:
-        return key, None
+        return key, None, removed_peak_count
 
     if _WORKER_MODE == "cnn":
         model_input = IonExtract(
@@ -771,7 +931,7 @@ def _extract_feature_for_key(key):
             features,
             _WORKER_MS1_WINDOW_MZ,
         )
-    return key, model_input
+    return key, model_input, removed_peak_count
 
 
 def _iter_feature_keys(theory_dict, feature_dict_map, scan_map):
@@ -934,6 +1094,8 @@ def _run_single_conversion(
 
     worker_count = max(1, int(_to_float(num_cpus, 1)))
     feature_payload = {}
+    removed_peak_total = 0
+    removed_psm_total = 0
     feature_keys = _iter_feature_keys(D_theory, D_feature, psm_scan_map)
     _set_worker_state(
         D_exp_ms1,
@@ -948,7 +1110,10 @@ def _run_single_conversion(
 
     if worker_count == 1:
         for key in feature_keys:
-            feature_key, model_input = _extract_feature_for_key(key)
+            feature_key, model_input, removed_peak_count = _extract_feature_for_key(key)
+            removed_peak_total += removed_peak_count
+            if removed_peak_count > 0:
+                removed_psm_total += 1
             if model_input is not None:
                 feature_payload[feature_key] = model_input
     else:
@@ -968,15 +1133,23 @@ def _run_single_conversion(
                 ms1_isolation_window_mz,
             )
         with ctx.Pool(**pool_kwargs) as pool:
-            for feature_key, model_input in pool.imap_unordered(
+            for feature_key, model_input, removed_peak_count in pool.imap_unordered(
                 _extract_feature_for_key,
                 feature_keys,
                 chunksize=8,
             ):
+                removed_peak_total += removed_peak_count
+                if removed_peak_count > 0:
+                    removed_psm_total += 1
                 if model_input is not None:
                     feature_payload[feature_key] = model_input
 
     print("Features generated!")
+    print(
+        "FT2 precursor-mass filtering: "
+        f"removed_peaks={removed_peak_total} "
+        f"affected_psms={removed_psm_total}"
+    )
     if os.path.exists(theoretical_file):
         os.remove(theoretical_file)
 

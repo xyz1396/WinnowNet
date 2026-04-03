@@ -44,6 +44,8 @@ note.md
 *.txt
 *.log
 test/*.png
+test/*.pdf
+data
 
 # OS files
 .DS_Store
