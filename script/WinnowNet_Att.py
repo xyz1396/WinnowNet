@@ -7,15 +7,12 @@ import torch.utils.data as Data
 import time
 import sys
 import getopt
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
 from datetime import timedelta
 from sklearn import metrics
 import numpy as np
 import glob
-import pickle
 import os
-from components.encoders import MassEncoder, PeakEncoder, PositionalEncoder
+from components.encoders import PeakEncoder
 from checkpoint_utils import (
     build_checkpoint_metadata,
     format_target_decoy_ratio,

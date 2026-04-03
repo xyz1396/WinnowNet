@@ -1,7 +1,5 @@
 #!/usr/bin/python
 
-import sys, getopt, warnings, os, re
-
 
 def getConfigMasterKeyValue (sMasterKey, dictConfigKeyValues) :
 	dictKeyValueSet = {}	

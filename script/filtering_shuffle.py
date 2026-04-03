@@ -7,7 +7,6 @@ from datetime import datetime, date, time
 import pandas as pd
 import sipros_post_module
 import parseconfig
-import sys
 
 ## Glboal variables
 pep_file_ext = '.pep.txt'
@@ -1094,6 +1093,5 @@ if __name__ == "__main__":
         f.write('\t'.join(pep_out_list) + '\n')
         for key, pep in filter_pep_list.items():
             f.write(pep.IdentifiedPeptide+'\t'+str(pep.ParentCharge)+'\t'+pep.OriginalPeptide+'\t'+'{'+pep.ProteinNames+'}'+'\t'+str(pep.ProteinCount)+'\t'+pep.TargetMatch+'\t'+str(pep.SpectralCount)+'\t'+str(pep.BestScore)+'\t'+','.join(pep.PSMs)+'\t'+pep.ScanType+'\t'+pep.SearchName+ '\n')
-
 
 

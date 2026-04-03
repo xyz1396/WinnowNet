@@ -4,13 +4,10 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.utils.data as Data
 import time
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
 from datetime import timedelta
 from sklearn import metrics
 import numpy as np
 import glob
-import pickle
 import sys
 import getopt
 import os

@@ -13,8 +13,8 @@ Copyright (c) 2012 Tae-Hyuk Ahn (ORNL). Allrights reserved.
 
 ## Import standard modules
 from __future__ import division
-import sys, getopt, warnings, os, re
-from datetime import datetime, date, time
+import sys, getopt, re
+from datetime import datetime
 from collections import defaultdict
 import csv
 
