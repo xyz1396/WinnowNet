@@ -20,10 +20,10 @@ from checkpoint_utils import (
 )
 from pkl_utils import (
     expand_pickle_inputs,
-    get_entry_group_key,
     get_entry_label,
     get_entry_label_confidence,
     get_entry_model_input,
+    get_entry_spectrum_group_key,
     load_feature_pickle,
     normalize_long_flag_aliases,
 )
@@ -43,50 +43,19 @@ def _load_checkpoint_weights(model_path):
     return state_dict
 
 
-def _parse_target_decoy_ratio(value, flag_name):
-    text = str(value).strip()
-    if len(text) == 0:
-        raise ValueError(f"{flag_name} must not be empty.")
-    if ":" in text:
-        target_text, decoy_text = text.split(":", 1)
-        try:
-            target_count = float(target_text)
-            decoy_count = float(decoy_text)
-        except ValueError:
-            raise ValueError(f"{flag_name} must look like 1:1 or 1:10.")
-        if target_count <= 0 or decoy_count <= 0:
-            raise ValueError(f"{flag_name} values must be greater than 0.")
-        return decoy_count / target_count
-    try:
-        decoy_per_target = float(text)
-    except ValueError:
-        raise ValueError(f"{flag_name} must be a positive number or ratio like 1:1.")
-    if decoy_per_target <= 0:
-        raise ValueError(f"{flag_name} must be greater than 0.")
-    return decoy_per_target
-
-
-def _apply_target_decoy_ratio(X, yweight, decoy_per_target, seed=10, dataset_name="train"):
+def _prepare_training_pool(X, yweight, dataset_name="train"):
     pos_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 1]
     neg_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 0]
     if len(pos_idx) == 0 or len(neg_idx) == 0:
         raise ValueError(f"[{dataset_name}] requires both target and decoy samples.")
 
     natural_ratio = len(neg_idx) / float(len(pos_idx))
-    if decoy_per_target is None:
-        print(
-            f"[{dataset_name}] using full training pool; "
-            f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)} "
-            f"natural_ratio=1:{natural_ratio:.4g}"
-        )
-        return X, yweight, natural_ratio
-
     print(
-        f"[{dataset_name}] using full training pool with weighted sampling; "
+        f"[{dataset_name}] using full training pool; "
         f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)} "
-        f"natural_ratio=1:{natural_ratio:.4g} effective_ratio=1:{decoy_per_target:.4g}"
+        f"natural_ratio=1:{natural_ratio:.4g}"
     )
-    return X, yweight, decoy_per_target
+    return X, yweight, natural_ratio
 
 
 def _compute_decoy_per_target(yweight):
@@ -97,44 +66,17 @@ def _compute_decoy_per_target(yweight):
     return negative / float(positive)
 
 
-def _build_train_loader(train_data, yweight_train, effective_decoy_per_target, seed=10):
+def _build_train_loader(train_data, yweight_train):
     total_samples = len(yweight_train)
-    if effective_decoy_per_target is None:
-        natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
-        target_probability = 1.0 / (1.0 + natural_decoy_per_target)
-        decoy_probability = natural_decoy_per_target / (1.0 + natural_decoy_per_target)
-        target_count = int(round(total_samples * target_probability))
-        decoy_count = total_samples - target_count
-        print(
-            f"[train] sampler target_count~{target_count} decoy_count~{decoy_count}"
-        )
-        return Data.DataLoader(train_data, batch_size=128, num_workers=8, shuffle=True, pin_memory=True)
-
-    positive = sum(1 for item in yweight_train if int(item[0]) == 1)
-    negative = sum(1 for item in yweight_train if int(item[0]) == 0)
-    if positive == 0 or negative == 0:
-        raise ValueError("Training data must contain both target and decoy samples.")
-
-    positive_probability = 1.0 / (1.0 + effective_decoy_per_target)
-    negative_probability = effective_decoy_per_target / (1.0 + effective_decoy_per_target)
-    target_count = int(round(total_samples * positive_probability))
+    natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
+    target_probability = 1.0 / (1.0 + natural_decoy_per_target)
+    decoy_probability = natural_decoy_per_target / (1.0 + natural_decoy_per_target)
+    target_count = int(round(total_samples * target_probability))
     decoy_count = total_samples - target_count
     print(
-        f"[train] sampler target_count~{target_count} decoy_count~{decoy_count}"
+        f"[train] input target_count~{target_count} decoy_count~{decoy_count}"
     )
-    sample_weights = [
-        positive_probability / float(positive) if int(item[0]) == 1 else negative_probability / float(negative)
-        for item in yweight_train
-    ]
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    sampler = Data.WeightedRandomSampler(
-        weights=torch.DoubleTensor(sample_weights),
-        num_samples=len(yweight_train),
-        replacement=True,
-        generator=generator,
-    )
-    return Data.DataLoader(train_data, batch_size=128, num_workers=8, shuffle=False, sampler=sampler, pin_memory=True)
+    return Data.DataLoader(train_data, batch_size=128, num_workers=8, shuffle=True, pin_memory=True)
 
 
 def _collect_prediction_scores(data, model, loss, device):
@@ -221,7 +163,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             if model_input is None:
                 continue
             psm_id = entry.get("psm_id", record_key) if isinstance(entry, dict) else record_key
-            group_key = get_entry_group_key(meta, psm_id, entry)
+            group_key = get_entry_spectrum_group_key(meta, psm_id, entry)
 
             if force_label is None:
                 label = get_entry_label(entry)
@@ -337,7 +279,7 @@ def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
     val_groups = {groups[i] for i in val_idx}
     test_groups = {groups[i] for i in test_idx}
     print(
-        "[split] grouped by peptide; "
+        "[split] grouped by spectrum; "
         f"total_groups={len(group_to_indices)} "
         f"train_groups={len(train_groups)} val_groups={len(val_groups)} test_groups={len(test_groups)}"
     )
@@ -644,11 +586,10 @@ if __name__ == "__main__":
             "-target": "--target",
             "-decoy": "--decoy",
             "-epochs": "--epochs",
-            "-target-decoy-ratio": "--target-decoy-ratio",
         },
     )
     try:
-        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy=", "epochs=", "target-decoy-ratio="])
+        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy=", "epochs="])
     except:
         print("Error Option, using -h for help information.")
         sys.exit(1)
@@ -660,14 +601,12 @@ if __name__ == "__main__":
         print("-target\t Target feature pickle(s), comma-separated or repeated\n")
         print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
         print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
-        print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
         sys.exit(1)
         start_time=time.time()
     input_directory=""
     model_name=""
     pretrained_model=""
     epochs = DEFAULT_EPOCHS
-    target_decoy_ratio = None
     target_inputs = []
     decoy_inputs = []
     for opt, arg in opts:
@@ -679,7 +618,6 @@ if __name__ == "__main__":
             print("-target\t Target feature pickle(s), comma-separated or repeated\n")
             print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
             print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
-            print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
             sys.exit(1)
         elif opt in ("-i"):
             input_directory=arg
@@ -695,8 +633,6 @@ if __name__ == "__main__":
             epochs = int(arg)
             if epochs <= 0:
                 raise ValueError("--epochs must be greater than 0.")
-        elif opt == "--target-decoy-ratio":
-            target_decoy_ratio = _parse_target_decoy_ratio(arg, "--target-decoy-ratio")
     start = time.time()
     split_mode = bool(target_inputs or decoy_inputs)
     if not split_mode and len(input_directory) == 0:
@@ -723,10 +659,9 @@ if __name__ == "__main__":
         L, Yweight, groups = _load_feature_records(target_pickles, dataset_name="embedded")
         (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_grouped(L, Yweight, groups)
 
-    X_train, yweight_train, effective_train_decoy_ratio = _apply_target_decoy_ratio(
+    X_train, yweight_train, effective_train_decoy_ratio = _prepare_training_pool(
         X_train,
         yweight_train,
-        target_decoy_ratio,
         dataset_name="train",
     )
 

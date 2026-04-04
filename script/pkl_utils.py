@@ -129,6 +129,16 @@ def canonicalize_peptide_sequence(value):
     return text
 
 
+def _base_spectrum_id(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parts = text.rsplit(".", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return text
+
+
 def get_entry_group_key(meta, psm_id, entry):
     if not is_rich_entry(entry):
         return str(psm_id)
@@ -144,6 +154,33 @@ def get_entry_group_key(meta, psm_id, entry):
     peptide_core = canonicalize_peptide_sequence(peptide_value)
     if peptide_core:
         return peptide_core
+    return str(psm_id)
+
+
+def get_entry_spectrum_group_key(meta, psm_id, entry):
+    base_id = _base_spectrum_id(psm_id)
+    if base_id:
+        return base_id
+    if not is_rich_entry(entry):
+        return str(psm_id)
+
+    row_map = get_entry_row_map(meta, psm_id, entry)
+    for column in ["PSMId", "SpecId"]:
+        base_id = _base_spectrum_id(row_map.get(column, ""))
+        if base_id:
+            return base_id
+
+    scan_value = ""
+    for column in ["ScanNr", "Scan", "scan"]:
+        scan_value = str(row_map.get(column, "")).strip()
+        if scan_value:
+            break
+
+    source_file = os.path.basename(str(meta.get("source_file", "")).strip())
+    if source_file and scan_value:
+        return f"{source_file}::{scan_value}"
+    if scan_value:
+        return f"scan::{scan_value}"
     return str(psm_id)
 
 

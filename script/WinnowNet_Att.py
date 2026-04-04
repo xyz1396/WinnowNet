@@ -22,10 +22,10 @@ from checkpoint_utils import (
 )
 from pkl_utils import (
     expand_pickle_inputs,
-    get_entry_group_key,
     get_entry_label,
     get_entry_label_confidence,
     get_entry_model_input,
+    get_entry_spectrum_group_key,
     load_feature_pickle,
     normalize_long_flag_aliases,
 )
@@ -71,50 +71,19 @@ def _parse_positive_int(value, flag_name):
     return parsed
 
 
-def _parse_target_decoy_ratio(value, flag_name):
-    text = str(value).strip()
-    if len(text) == 0:
-        raise ValueError(f"{flag_name} must not be empty.")
-    if ":" in text:
-        target_text, decoy_text = text.split(":", 1)
-        try:
-            target_count = float(target_text)
-            decoy_count = float(decoy_text)
-        except ValueError:
-            raise ValueError(f"{flag_name} must look like 1:1 or 1:10.")
-        if target_count <= 0 or decoy_count <= 0:
-            raise ValueError(f"{flag_name} values must be greater than 0.")
-        return decoy_count / target_count
-    try:
-        decoy_per_target = float(text)
-    except ValueError:
-        raise ValueError(f"{flag_name} must be a positive number or ratio like 1:1.")
-    if decoy_per_target <= 0:
-        raise ValueError(f"{flag_name} must be greater than 0.")
-    return decoy_per_target
-
-
-def _apply_target_decoy_ratio(X, yweight, decoy_per_target, seed=10, dataset_name="train"):
+def _prepare_training_pool(X, yweight, dataset_name="train"):
     pos_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 1]
     neg_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 0]
     if len(pos_idx) == 0 or len(neg_idx) == 0:
         raise ValueError(f"[{dataset_name}] requires both target and decoy samples.")
 
     natural_ratio = len(neg_idx) / float(len(pos_idx))
-    if decoy_per_target is None:
-        print(
-            f"[{dataset_name}] using full training pool; "
-            f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)} "
-            f"natural_ratio=1:{natural_ratio:.4g}"
-        )
-        return X, yweight, natural_ratio
-
     print(
-        f"[{dataset_name}] using full training pool with weighted sampling; "
+        f"[{dataset_name}] using full training pool; "
         f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)} "
-        f"natural_ratio=1:{natural_ratio:.4g} effective_ratio=1:{decoy_per_target:.4g}"
+        f"natural_ratio=1:{natural_ratio:.4g}"
     )
-    return X, yweight, decoy_per_target
+    return X, yweight, natural_ratio
 
 
 def _load_checkpoint_weights(model_path):
@@ -130,55 +99,21 @@ def _compute_decoy_per_target(yweight):
     return negative / float(positive)
 
 
-def _build_train_loader(train_data, yweight_train, batch_size, effective_decoy_per_target, seed=10):
+def _build_train_loader(train_data, yweight_train, batch_size):
     total_samples = len(yweight_train)
-    if effective_decoy_per_target is None:
-        natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
-        target_probability = 1.0 / (1.0 + natural_decoy_per_target)
-        decoy_probability = natural_decoy_per_target / (1.0 + natural_decoy_per_target)
-        target_count = int(round(total_samples * target_probability))
-        decoy_count = total_samples - target_count
-        print(
-            f"[train] sampler target_count~{target_count} decoy_count~{decoy_count}"
-        )
-        return Data.DataLoader(
-            train_data,
-            batch_size=batch_size,
-            num_workers=8,
-            shuffle=True,
-            pin_memory=True,
-        )
-
-    positive = sum(1 for item in yweight_train if int(item[0]) == 1)
-    negative = sum(1 for item in yweight_train if int(item[0]) == 0)
-    if positive == 0 or negative == 0:
-        raise ValueError("Training data must contain both target and decoy samples.")
-
-    positive_probability = 1.0 / (1.0 + effective_decoy_per_target)
-    negative_probability = effective_decoy_per_target / (1.0 + effective_decoy_per_target)
-    target_count = int(round(total_samples * positive_probability))
+    natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
+    target_probability = 1.0 / (1.0 + natural_decoy_per_target)
+    decoy_probability = natural_decoy_per_target / (1.0 + natural_decoy_per_target)
+    target_count = int(round(total_samples * target_probability))
     decoy_count = total_samples - target_count
     print(
-        f"[train] sampler target_count~{target_count} decoy_count~{decoy_count}"
-    )
-    sample_weights = [
-        positive_probability / float(positive) if int(item[0]) == 1 else negative_probability / float(negative)
-        for item in yweight_train
-    ]
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    sampler = Data.WeightedRandomSampler(
-        weights=torch.DoubleTensor(sample_weights),
-        num_samples=len(yweight_train),
-        replacement=True,
-        generator=generator,
+        f"[train] input target_count~{target_count} decoy_count~{decoy_count}"
     )
     return Data.DataLoader(
         train_data,
         batch_size=batch_size,
         num_workers=8,
-        shuffle=False,
-        sampler=sampler,
+        shuffle=True,
         pin_memory=True,
     )
 
@@ -277,7 +212,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             if model_input is None:
                 continue
             psm_id = entry.get("psm_id", record_key) if isinstance(entry, dict) else record_key
-            group_key = get_entry_group_key(meta, psm_id, entry)
+            group_key = get_entry_spectrum_group_key(meta, psm_id, entry)
 
             if force_label is None:
                 label = get_entry_label(entry)
@@ -413,7 +348,7 @@ def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
     val_groups = {groups[i] for i in val_idx}
     test_groups = {groups[i] for i in test_idx}
     print(
-        "[split] grouped by peptide; "
+        "[split] grouped by spectrum; "
         f"total_groups={len(group_to_indices)} "
         f"train_groups={len(train_groups)} val_groups={len(val_groups)} test_groups={len(test_groups)}"
     )
@@ -481,11 +416,65 @@ class MS2Encoder(nn.Module):
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
 
     def forward(self, spectra: torch.Tensor):
-        B, P, _ = spectra.shape
         src_key_padding_mask = spectra.sum(dim=2) == 0
         peaks = self.peak_encoder(spectra)
         out = self.transformer(peaks, src_key_padding_mask=src_key_padding_mask)
+        return out, src_key_padding_mask
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        dim_model: int,
+        n_heads: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(dim_model)
+        self.ff = nn.Sequential(
+            nn.Linear(dim_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, dim_model),
+        )
+        self.norm2 = nn.LayerNorm(dim_model)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        context: torch.Tensor,
+        query_padding_mask: torch.Tensor,
+        context_padding_mask: torch.Tensor,
+    ):
+        attended, _ = self.attention(
+            query=query,
+            key=context,
+            value=context,
+            key_padding_mask=context_padding_mask,
+            need_weights=False,
+        )
+        out = self.norm1(query + self.dropout(attended))
+        out = self.norm2(out + self.dropout(self.ff(out)))
+        if query_padding_mask is not None:
+            out = out.masked_fill(query_padding_mask.unsqueeze(-1), 0.0)
         return out
+
+
+def _masked_mean_pool(sequence: torch.Tensor, padding_mask: torch.Tensor):
+    if padding_mask is None:
+        return sequence.mean(dim=1)
+    valid_mask = (~padding_mask).unsqueeze(-1).type_as(sequence)
+    pooled = (sequence * valid_mask).sum(dim=1)
+    counts = valid_mask.sum(dim=1).clamp_min(1.0)
+    return pooled / counts
 
 class DualPeakClassifier(nn.Module):
     def __init__(
@@ -500,24 +489,54 @@ class DualPeakClassifier(nn.Module):
         max_len: int = 200,
     ):
         super().__init__()
-        self.encoder1 = MS2Encoder(
+        self.sequence_encoder = MS2Encoder(
             dim_model, dim_intensity, n_heads, dim_feedforward, n_layers, dropout, max_len
         )
-        self.encoder2 = MS2Encoder(
-            dim_model, dim_intensity, n_heads, dim_feedforward, n_layers, dropout, max_len
+        self.exp_from_theory = CrossAttentionBlock(
+            dim_model=dim_model,
+            n_heads=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
         )
-        self.classifier = nn.Linear(2 * dim_model, num_classes)
+        self.theory_from_exp = CrossAttentionBlock(
+            dim_model=dim_model,
+            n_heads=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(4 * dim_model, 2 * dim_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * dim_model, num_classes),
+        )
 
     def forward(
         self,
         spectra1: torch.Tensor,
         spectra2: torch.Tensor,
     ):
-        out1 = self.encoder1(spectra1)
-        out2 = self.encoder2(spectra2)
-        rep1 = out1.mean(dim=1)
-        rep2 = out2.mean(dim=1)
-        joint = torch.cat([rep1, rep2], dim=-1)
+        exp_encoded, exp_padding_mask = self.sequence_encoder(spectra1)
+        theory_encoded, theory_padding_mask = self.sequence_encoder(spectra2)
+
+        exp_matched = self.exp_from_theory(
+            query=exp_encoded,
+            context=theory_encoded,
+            query_padding_mask=exp_padding_mask,
+            context_padding_mask=theory_padding_mask,
+        )
+        theory_matched = self.theory_from_exp(
+            query=theory_encoded,
+            context=exp_encoded,
+            query_padding_mask=theory_padding_mask,
+            context_padding_mask=exp_padding_mask,
+        )
+
+        rep1 = _masked_mean_pool(exp_matched, exp_padding_mask)
+        rep2 = _masked_mean_pool(theory_matched, theory_padding_mask)
+        abs_diff = torch.abs(rep1 - rep2)
+        prod = rep1 * rep2
+        joint = torch.cat([rep1, rep2, abs_diff, prod], dim=-1)
         outputs = self.classifier(joint)
         return outputs
 
@@ -656,7 +675,6 @@ def train_model(
         train_data,
         yweight_train,
         train_batch_size,
-        train_decoy_per_target,
     )
     for epoch in range(0, epochs):
         start_time = time.time()
@@ -727,14 +745,13 @@ if __name__ == "__main__":
             "-eval-batch-size": "--eval-batch-size",
             "-max-peaks": "--max-peaks",
             "-epochs": "--epochs",
-            "-target-decoy-ratio": "--target-decoy-ratio",
         },
     )
     try:
         opts, args = getopt.getopt(
             argv,
             "hi:m:p:",
-            ["target=", "decoy=", "train-batch-size=", "eval-batch-size=", "max-peaks=", "epochs=", "target-decoy-ratio="],
+            ["target=", "decoy=", "train-batch-size=", "eval-batch-size=", "max-peaks=", "epochs="],
         )
     except:
         print("Error Option, using -h for help information.")
@@ -750,7 +767,6 @@ if __name__ == "__main__":
         print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
         print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
         print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
-        print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
         sys.exit(1)
         start_time=time.time()
     input_directory=""
@@ -760,7 +776,6 @@ if __name__ == "__main__":
     eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
     max_peaks = DEFAULT_MAX_PEAKS
     epochs = DEFAULT_EPOCHS
-    target_decoy_ratio = None
     target_inputs = []
     decoy_inputs = []
     for opt, arg in opts:
@@ -775,7 +790,6 @@ if __name__ == "__main__":
             print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
             print("--max-peaks\t Number of top-intensity peaks kept per spectrum (default: " + str(DEFAULT_MAX_PEAKS) + ")\n")
             print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
-            print("--target-decoy-ratio\t Training-set target:decoy ratio, for example 1:1 or 1:2 (default: keep all)\n")
             sys.exit(1)
         elif opt in ("-i"):
             input_directory=arg
@@ -795,8 +809,6 @@ if __name__ == "__main__":
             max_peaks = _parse_positive_int(arg, "--max-peaks")
         elif opt == "--epochs":
             epochs = _parse_positive_int(arg, "--epochs")
-        elif opt == "--target-decoy-ratio":
-            target_decoy_ratio = _parse_target_decoy_ratio(arg, "--target-decoy-ratio")
     start = time.time()
     split_mode = bool(target_inputs or decoy_inputs)
     if not split_mode and len(input_directory) == 0:
@@ -823,10 +835,9 @@ if __name__ == "__main__":
         L, Yweight, groups = _load_feature_records(target_pickles, dataset_name="embedded")
         (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_grouped(L, Yweight, groups)
 
-    X_train, yweight_train, effective_train_decoy_ratio = _apply_target_decoy_ratio(
+    X_train, yweight_train, effective_train_decoy_ratio = _prepare_training_pool(
         X_train,
         yweight_train,
-        target_decoy_ratio,
         dataset_name="train",
     )
 
