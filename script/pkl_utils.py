@@ -119,6 +119,45 @@ def get_entry_row_map(meta, psm_id, entry):
     return row_map
 
 
+def parse_prefix_filters(value):
+    if value is None:
+        return []
+    prefixes = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if item:
+            prefixes.append(item)
+    return prefixes
+
+
+def _extract_protein_names(text):
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return []
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        cleaned = cleaned[1:-1]
+    proteins = []
+    for item in cleaned.split(","):
+        item = item.strip()
+        if item:
+            proteins.append(item)
+    return proteins
+
+
+def proteins_all_match_prefixes(row_map, prefixes):
+    if not prefixes:
+        return False
+    protein_text = ""
+    for column in ["Proteins", "Proteinname", "ProteinNames"]:
+        protein_text = str(row_map.get(column, "")).strip()
+        if protein_text:
+            break
+    proteins = _extract_protein_names(protein_text)
+    if not proteins:
+        return False
+    return all(any(protein.startswith(prefix) for prefix in prefixes) for protein in proteins)
+
+
 def canonicalize_peptide_sequence(value):
     text = str(value or "").strip()
     if not text:

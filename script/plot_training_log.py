@@ -12,7 +12,7 @@ EPOCH_PATTERN = re.compile(
     rf"Train_Posprec\s*({FLOAT_PATTERN})%,\s*Train_Negprec\s*({FLOAT_PATTERN})%,\s*"
     rf"Val_loss:\s*({FLOAT_PATTERN}),\s*Val_acc\s*({FLOAT_PATTERN})%,\s*"
     rf"Val_Posprec\s*({FLOAT_PATTERN})%,\s*Val_Negprec\s*({FLOAT_PATTERN})%,\s*"
-    rf"BestPredRatio\s*1:({FLOAT_PATTERN}),\s*BestThreshold\s*({FLOAT_PATTERN}),\s*"
+    rf"(?:[^\n]*?)BestThreshold\s*({FLOAT_PATTERN}),\s*"
     rf"BestTargets@FDR<=1%\s*(\d+),\s*BestValFDR\s*({FLOAT_PATTERN})%"
 )
 TEST_PATTERN = re.compile(
@@ -46,10 +46,9 @@ def load_rows(log_path):
                 "val_acc": float(match.group(7)),
                 "val_posprec": float(match.group(8)),
                 "val_negprec": float(match.group(9)),
-                "best_pred_ratio": float(match.group(10)),
-                "best_threshold": float(match.group(11)),
-                "best_targets": int(match.group(12)),
-                "best_val_fdr": float(match.group(13)),
+                "best_threshold": float(match.group(10)),
+                "best_targets": int(match.group(11)),
+                "best_val_fdr": float(match.group(12)),
             }
         )
     if not rows:
@@ -79,8 +78,9 @@ def plot_rows(rows, output_path, title):
     val_loss = [row["val_loss"] for row in rows]
     train_acc = [row["train_acc"] for row in rows]
     val_acc = [row["val_acc"] for row in rows]
+    val_posprec = [row["val_posprec"] for row in rows]
+    val_negprec = [row["val_negprec"] for row in rows]
     best_threshold = [row["best_threshold"] for row in rows]
-    best_pred_ratio = [row["best_pred_ratio"] for row in rows]
     has_test_metrics = any("test_acc" in row for row in rows)
     test_acc = [row.get("test_acc") for row in rows]
     test_f1 = [row.get("test_f1") for row in rows]
@@ -156,10 +156,12 @@ def plot_rows(rows, output_path, title):
     ax.grid(True, alpha=0.25)
 
     ax = axes[2, 1]
-    ax.plot(epochs, best_pred_ratio, color="#9333ea", linewidth=2)
-    ax.set_title("BestPredRatio (1:x)")
+    ax.plot(epochs, val_posprec, label="Val target", color="#9333ea", linewidth=2)
+    ax.plot(epochs, val_negprec, label="Val decoy", color="#c2410c", linewidth=2)
+    ax.set_title("Validation Precision")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("x")
+    ax.set_ylabel("Precision (%)")
+    ax.legend(frameon=False)
     ax.grid(True, alpha=0.25)
 
     ax = axes[3, 0]
@@ -213,7 +215,6 @@ def main():
         f"best_targets_epoch={best_target_row['epoch']} "
         f"best_targets={best_target_row['best_targets']} "
         f"best_threshold={best_target_row['best_threshold']:.4f} "
-        f"best_pred_ratio=1:{best_target_row['best_pred_ratio']:.4f} "
         f"best_val_fdr={best_target_row['best_val_fdr']:.4f}%"
     )
     test_rows = [row for row in rows if "test_f1" in row]

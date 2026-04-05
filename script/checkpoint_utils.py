@@ -22,8 +22,6 @@ def load_checkpoint_bundle(model_path):
     required_metadata = [
         "checkpoint_format_version",
         "model_type",
-        "train_target_decoy_ratio",
-        "best_prediction_target_decoy_ratio",
         "best_decision_threshold",
     ]
     for key in required_metadata:
@@ -45,15 +43,11 @@ def save_checkpoint_bundle(model_path, state_dict, metadata=None):
 
 def build_checkpoint_metadata(
     model_type,
-    train_target_decoy_ratio,
-    best_prediction_target_decoy_ratio,
     best_decision_threshold,
     max_peaks=None,
 ):
     metadata = {
         "model_type": model_type,
-        "train_target_decoy_ratio": float(train_target_decoy_ratio),
-        "best_prediction_target_decoy_ratio": float(best_prediction_target_decoy_ratio),
         "best_decision_threshold": float(best_decision_threshold),
     }
     if max_peaks is not None:
@@ -63,27 +57,3 @@ def build_checkpoint_metadata(
 
 def checkpoint_display_name(model_path):
     return os.path.abspath(model_path)
-
-
-def format_target_decoy_ratio(decoy_per_target):
-    return "1:{0:.6g}".format(float(decoy_per_target))
-
-
-def decision_threshold_from_ratios(train_decoy_per_target, prediction_decoy_per_target):
-    train_decoy_per_target = float(train_decoy_per_target)
-    prediction_decoy_per_target = float(prediction_decoy_per_target)
-    if train_decoy_per_target <= 0 or prediction_decoy_per_target <= 0:
-        raise ValueError("Target:decoy ratios must be greater than 0.")
-    return prediction_decoy_per_target / (train_decoy_per_target + prediction_decoy_per_target)
-
-
-def prediction_ratio_from_threshold(train_decoy_per_target, decision_threshold):
-    train_decoy_per_target = float(train_decoy_per_target)
-    decision_threshold = float(decision_threshold)
-    if train_decoy_per_target <= 0:
-        raise ValueError("Training target:decoy ratio must be greater than 0.")
-    if decision_threshold <= 0.0:
-        return 0.0
-    if decision_threshold >= 1.0:
-        return float("inf")
-    return train_decoy_per_target * decision_threshold / (1.0 - decision_threshold)

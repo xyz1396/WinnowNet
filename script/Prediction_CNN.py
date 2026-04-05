@@ -8,11 +8,7 @@ import torch.utils.data as Data
 from torch.autograd import Variable
 
 from WinnowNet_CNN import Net
-from checkpoint_utils import (
-    decision_threshold_from_ratios,
-    format_target_decoy_ratio,
-    load_checkpoint_bundle,
-)
+from checkpoint_utils import load_checkpoint_bundle
 from pkl_utils import (
     choose_output_column,
     format_label_value,
@@ -66,29 +62,6 @@ def _parse_probability(value, flag_name):
     if parsed < 0.0 or parsed > 1.0:
         raise ValueError(f"{flag_name} must be between 0 and 1.")
     return parsed
-
-
-def _parse_target_decoy_ratio(value, flag_name):
-    text = str(value).strip()
-    if len(text) == 0:
-        raise ValueError(f"{flag_name} must not be empty.")
-    if ":" in text:
-        target_text, decoy_text = text.split(":", 1)
-        try:
-            target_count = float(target_text)
-            decoy_count = float(decoy_text)
-        except ValueError:
-            raise ValueError(f"{flag_name} must look like 1:1 or 1:10.")
-        if target_count <= 0 or decoy_count <= 0:
-            raise ValueError(f"{flag_name} values must be greater than 0.")
-        return decoy_count / target_count
-    try:
-        decoy_per_target = float(text)
-    except ValueError:
-        raise ValueError(f"{flag_name} must be a positive number or ratio like 1:1.")
-    if decoy_per_target <= 0:
-        raise ValueError(f"{flag_name} must be greater than 0.")
-    return decoy_per_target
 
 
 def _compute_qvalues(scores, labels):
@@ -210,11 +183,10 @@ if __name__ == "__main__":
         {
             "-batch-size": "--batch-size",
             "-decision-threshold": "--decision-threshold",
-            "-target-decoy-ratio": "--target-decoy-ratio",
         },
     )
     try:
-        opts, args = getopt.getopt(argv, "hi:m:o:", ["batch-size=", "decision-threshold=", "target-decoy-ratio="])
+        opts, args = getopt.getopt(argv, "hi:m:o:", ["batch-size=", "decision-threshold="])
     except Exception:
         print("Error Option, using -h for help information.")
         sys.exit(1)
@@ -224,7 +196,6 @@ if __name__ == "__main__":
         print("-m\t Pre-trained model name\n")
         print("-o\t Output rescored TSV file\n")
         print("--batch-size\t Prediction batch size (default: " + str(DEFAULT_BATCH_SIZE) + ")\n")
-        print("--target-decoy-ratio\t Prediction target:decoy ratio, for example 1:10 (default: best value from checkpoint)\n")
         print("--decision-threshold\t Predict target when p(target) >= threshold (default: best value from checkpoint)\n")
         sys.exit(1)
 
@@ -232,7 +203,6 @@ if __name__ == "__main__":
     model_name = ""
     output_file = ""
     batch_size = DEFAULT_BATCH_SIZE
-    prediction_target_decoy_ratio = None
     decision_threshold = None
     for opt, arg in opts:
         if opt in ("-h"):
@@ -241,7 +211,6 @@ if __name__ == "__main__":
             print("-m\t Pre-trained model name\n")
             print("-o\t Output rescored TSV file\n")
             print("--batch-size\t Prediction batch size (default: " + str(DEFAULT_BATCH_SIZE) + ")\n")
-            print("--target-decoy-ratio\t Prediction target:decoy ratio, for example 1:10 (default: best value from checkpoint)\n")
             print("--decision-threshold\t Predict target when p(target) >= threshold (default: best value from checkpoint)\n")
             sys.exit(1)
         elif opt in ("-i"):
@@ -254,8 +223,6 @@ if __name__ == "__main__":
             batch_size = int(arg)
             if batch_size <= 0:
                 raise ValueError("--batch-size must be greater than 0.")
-        elif opt == "--target-decoy-ratio":
-            prediction_target_decoy_ratio = _parse_target_decoy_ratio(arg, "--target-decoy-ratio")
         elif opt == "--decision-threshold":
             decision_threshold = _parse_probability(arg, "--decision-threshold")
 
@@ -263,33 +230,10 @@ if __name__ == "__main__":
     if len(meta.get("columns", [])) == 0:
         raise ValueError("Input pickle does not contain the original TSV/PIN row metadata.")
     checkpoint_metadata = _load_checkpoint_metadata(model_name)
-    train_ratio = float(checkpoint_metadata["train_target_decoy_ratio"])
-    best_ratio = float(checkpoint_metadata["best_prediction_target_decoy_ratio"])
     best_threshold = float(checkpoint_metadata["best_decision_threshold"])
-    if prediction_target_decoy_ratio is None:
-        prediction_target_decoy_ratio = best_ratio
-        print("Using best prediction ratio from checkpoint: " + format_target_decoy_ratio(prediction_target_decoy_ratio))
-    elif abs(prediction_target_decoy_ratio - best_ratio) > 1e-9:
-        print(
-            "WARNING: --target-decoy-ratio "
-            + format_target_decoy_ratio(prediction_target_decoy_ratio)
-            + " differs from checkpoint best "
-            + format_target_decoy_ratio(best_ratio)
-        )
     if decision_threshold is None:
-        if abs(prediction_target_decoy_ratio - best_ratio) <= 1e-9:
-            decision_threshold = best_threshold
-            print("Using best decision threshold from checkpoint: " + str(decision_threshold))
-        else:
-            decision_threshold = decision_threshold_from_ratios(train_ratio, prediction_target_decoy_ratio)
-            print(
-                "Using decision threshold derived from train ratio "
-                + format_target_decoy_ratio(train_ratio)
-                + " and prediction ratio "
-                + format_target_decoy_ratio(prediction_target_decoy_ratio)
-                + ": "
-                + str(decision_threshold)
-            )
+        decision_threshold = best_threshold
+        print("Using best decision threshold from checkpoint: " + str(decision_threshold))
     elif abs(decision_threshold - best_threshold) > 1e-9:
         print("WARNING: --decision-threshold " + str(decision_threshold) + " differs from checkpoint best " + str(best_threshold))
 

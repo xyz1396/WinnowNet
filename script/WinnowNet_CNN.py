@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
-import torch.nn.functional as F
 import torch.utils.data as Data
 import time
 from datetime import timedelta
@@ -13,9 +12,7 @@ import getopt
 import os
 from checkpoint_utils import (
     build_checkpoint_metadata,
-    format_target_decoy_ratio,
     load_checkpoint_bundle,
-    prediction_ratio_from_threshold,
     save_checkpoint_bundle,
 )
 from pkl_utils import (
@@ -23,9 +20,12 @@ from pkl_utils import (
     get_entry_label,
     get_entry_label_confidence,
     get_entry_model_input,
+    get_entry_row_map,
     get_entry_spectrum_group_key,
     load_feature_pickle,
     normalize_long_flag_aliases,
+    parse_prefix_filters,
+    proteins_all_match_prefixes,
 )
 
 threshold=0.9
@@ -49,13 +49,11 @@ def _prepare_training_pool(X, yweight, dataset_name="train"):
     if len(pos_idx) == 0 or len(neg_idx) == 0:
         raise ValueError(f"[{dataset_name}] requires both target and decoy samples.")
 
-    natural_ratio = len(neg_idx) / float(len(pos_idx))
     print(
         f"[{dataset_name}] using full training pool; "
-        f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)} "
-        f"natural_ratio=1:{natural_ratio:.4g}"
+        f"available_targets={len(pos_idx)} available_decoys={len(neg_idx)}"
     )
-    return X, yweight, natural_ratio
+    return X, yweight
 
 
 def _compute_decoy_per_target(yweight):
@@ -86,10 +84,10 @@ def _collect_prediction_scores(data, model, loss, device):
     y_true = []
     y_scores = []
     for data1, label, weight in data_loader:
-        data1, label, weight = Variable(data1), Variable(label), Variable(weight)
-        data1, label, weight = data1.to(device), label.to(device), weight.to(device)
+        data1, label = Variable(data1), Variable(label)
+        data1, label = data1.to(device), label.to(device)
         output = model(data1)
-        losses = loss(output, label, weight)
+        losses = loss(output, label)
         total_loss += losses.data.item()
         pred_prob = torch.softmax(output.data, dim=1)[:, 1].detach().cpu().numpy()
         y_scores.extend(pred_prob.tolist())
@@ -99,9 +97,9 @@ def _collect_prediction_scores(data, model, loss, device):
     return total_loss / data_len, np.asarray(y_true, dtype=int), np.asarray(y_scores, dtype=float)
 
 
-def _select_best_prediction_defaults(y_true, y_scores, train_decoy_per_target):
+def _select_best_prediction_defaults(y_true, y_scores):
     if len(y_scores) == 0:
-        return train_decoy_per_target, 0.5, 0, 0.0
+        return 0.5, 0, 0.0
 
     candidate_thresholds = np.unique(np.asarray(y_scores, dtype=float))
     if len(candidate_thresholds) > 512:
@@ -132,11 +130,10 @@ def _select_best_prediction_defaults(y_true, y_scores, train_decoy_per_target):
             elif abs(current_fdr - best_fdr) <= 1e-12 and threshold_value > best_threshold:
                 best_threshold = float(threshold_value)
 
-    best_ratio = prediction_ratio_from_threshold(train_decoy_per_target, best_threshold)
-    return best_ratio, best_threshold, best_target_count, best_fdr
+    return best_threshold, best_target_count, best_fdr
 
 
-def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset"):
+def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset", exclude_protein_prefixes=None):
     L = []
     Yweight = []
     groups = []
@@ -146,6 +143,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
     kept_rows = 0
     skipped_non_one = 0
     unlabeled_rows = 0
+    skipped_excluded_proteins = 0
 
     for feature_path in feature_paths:
         file_positive = 0
@@ -154,6 +152,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
         file_kept_rows = 0
         file_skipped_non_one = 0
         file_unlabeled_rows = 0
+        file_skipped_excluded_proteins = 0
         file_groups = set()
         meta, entries = load_feature_pickle(feature_path)
         for record_key, entry in entries.items():
@@ -163,6 +162,11 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             if model_input is None:
                 continue
             psm_id = entry.get("psm_id", record_key) if isinstance(entry, dict) else record_key
+            row_map = get_entry_row_map(meta, psm_id, entry) if isinstance(entry, dict) else {}
+            if proteins_all_match_prefixes(row_map, exclude_protein_prefixes):
+                skipped_excluded_proteins += 1
+                file_skipped_excluded_proteins += 1
+                continue
             group_key = get_entry_spectrum_group_key(meta, psm_id, entry)
 
             if force_label is None:
@@ -208,13 +212,15 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             f"kept_psms={file_kept_rows} kept_targets={file_positive} kept_decoys={file_negative} "
             f"unique_groups={len(file_groups)} "
             f"total_rows={file_total_rows} unlabeled_rows={file_unlabeled_rows} "
-            f"skipped_label_not_1={file_skipped_non_one}"
+            f"skipped_label_not_1={file_skipped_non_one} "
+            f"skipped_excluded_proteins={file_skipped_excluded_proteins}"
         )
 
     print(
         f"[{dataset_name}] kept_targets={positive} kept_decoys={negative} "
         f"total_rows={total_rows} kept_rows={kept_rows} "
-        f"unlabeled_rows={unlabeled_rows} skipped_label_not_1={skipped_non_one}"
+        f"unlabeled_rows={unlabeled_rows} skipped_label_not_1={skipped_non_one} "
+        f"skipped_excluded_proteins={skipped_excluded_proteins}"
     )
     return L, Yweight, groups
 
@@ -313,16 +319,6 @@ class DefineDataset(Data.Dataset):
         return xFeatures, y, weight
 
 
-
-class my_loss(torch.nn.Module):
-    def __init__(self):
-        super(my_loss, self).__init__()
-
-    def forward(self, outputs, targets, weight_label):
-        weight_label = weight_label.float()
-        entropy = -F.log_softmax(outputs, dim=1)
-        w_entropy = weight_label * entropy[:, 1] + (1 - weight_label) * entropy[:, 0]
-        return torch.mean(w_entropy)
 
 class T_Net(nn.Module):
     def __init__(self, k):
@@ -435,11 +431,11 @@ def evaluate(data, model, loss, device):
     y_true, y_pred = [], []
 
     for data1, label, weight in data_loader:
-        data1, label, weight = Variable(data1), Variable(label), Variable(weight)
-        data1, label, weight = data1.to(device),label.to(device), weight.to(device)
+        data1, label = Variable(data1), Variable(label)
+        data1, label = data1.to(device),label.to(device)
 
         output = model(data1)
-        losses = loss(output, label, weight)
+        losses = loss(output, label)
 
         total_loss += losses.data.item()
         pred = torch.max(output.data, dim=1)[1].cpu().numpy().tolist()
@@ -503,7 +499,7 @@ def test_model(model, test_data, device, model_str):
     print("Time usage:", get_time_dif(start_time))
 
 
-def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test,model_name,pretrained_model,effective_train_decoy_ratio, epochs):
+def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test,model_name,pretrained_model, epochs):
     LR = 1e-3
     train_data = DefineDataset(X_train, yweight_train)
     val_data = DefineDataset(X_val, yweight_val)
@@ -517,15 +513,14 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
     if len(pretrained_model)>0:
         print("loading pretrained_model")
         model.load_state_dict(_load_checkpoint_weights(pretrained_model))
-    criterion = my_loss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     #model.load_state_dict(
     #    torch.load('cnn_pytorch.pt', map_location=lambda storage, loc: storage))
     #test_model(model, test_data, device)
     best_loss = 10000
-    train_decoy_per_target = effective_train_decoy_ratio
     print("Epochs: " + str(epochs))
-    train_loader = _build_train_loader(train_data, yweight_train, train_decoy_per_target)
+    train_loader = _build_train_loader(train_data, yweight_train)
     checkpoint_paths = []
     for epoch in range(0, epochs):
         start_time = time.time()
@@ -535,28 +530,23 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
         model.train()
         for x1_batch, y_batch, weight in train_loader:
             batch_count = batch_count + 1
-            inputs, targets, weight = Variable(x1_batch),Variable(y_batch), Variable(
-                weight)
-            inputs, targets, weight = inputs.to(device), targets.to(device), weight.to(
-                device)
+            inputs, targets = Variable(x1_batch),Variable(y_batch)
+            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)  # forward computation
-            loss = criterion(outputs, targets, weight)
+            loss = criterion(outputs, targets)
             # backward propagation and update parameters
             loss.backward()
             optimizer.step()
         train_acc, train_loss, train_Posprec, train_Negprec = evaluate(train_data, model, criterion, device)
         val_acc, val_loss, val_PosPrec, val_Negprec = evaluate(val_data, model, criterion, device)
         _, val_y_true, val_y_scores = _collect_prediction_scores(val_data, model, criterion, device)
-        best_prediction_ratio, best_threshold, best_target_count, best_val_fdr = _select_best_prediction_defaults(
+        best_threshold, best_target_count, best_val_fdr = _select_best_prediction_defaults(
             val_y_true,
             val_y_scores,
-            train_decoy_per_target,
         )
         checkpoint_metadata = build_checkpoint_metadata(
             model_type="cnn",
-            train_target_decoy_ratio=train_decoy_per_target,
-            best_prediction_target_decoy_ratio=best_prediction_ratio,
             best_decision_threshold=best_threshold,
         )
         checkpoint_path = 'checkpoints/epoch' + str(epoch) + '.pt'
@@ -569,9 +559,9 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
         time_dif = get_time_dif(start_time)
         msg = "Epoch {0:3}, Train_loss: {1:>7.2}, Train_acc {2:>6.2%}, Train_Posprec {3:>6.2%}, Train_Negprec {" \
               "4:>6.2%}, " + "Val_loss: {5:>6.2}, Val_acc {6:>6.2%},Val_Posprec {7:6.2%}, Val_Negprec {8:6.2%}, " \
-              "BestPredRatio {9}, BestThreshold {10:.4f}, BestTargets@FDR<=1% {11}, BestValFDR {12:.4%} Time: {13} "
+              "BestThreshold {9:.4f}, BestTargets@FDR<=1% {10}, BestValFDR {11:.4%} Time: {12} "
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
-                         val_PosPrec, val_Negprec, format_target_decoy_ratio(best_prediction_ratio), best_threshold, best_target_count, best_val_fdr, time_dif))
+                         val_PosPrec, val_Negprec, best_threshold, best_target_count, best_val_fdr, time_dif))
 
     print("Best model path: " + model_name)
     for checkpoint_path in checkpoint_paths:
@@ -586,10 +576,11 @@ if __name__ == "__main__":
             "-target": "--target",
             "-decoy": "--decoy",
             "-epochs": "--epochs",
+            "-exclude-protein-prefix": "--exclude-protein-prefix",
         },
     )
     try:
-        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy=", "epochs="])
+        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy=", "epochs=", "exclude-protein-prefix="])
     except:
         print("Error Option, using -h for help information.")
         sys.exit(1)
@@ -601,12 +592,14 @@ if __name__ == "__main__":
         print("-target\t Target feature pickle(s), comma-separated or repeated\n")
         print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
         print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
+        print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
         sys.exit(1)
         start_time=time.time()
     input_directory=""
     model_name=""
     pretrained_model=""
     epochs = DEFAULT_EPOCHS
+    exclude_protein_prefixes = []
     target_inputs = []
     decoy_inputs = []
     for opt, arg in opts:
@@ -618,6 +611,7 @@ if __name__ == "__main__":
             print("-target\t Target feature pickle(s), comma-separated or repeated\n")
             print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
             print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
+            print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
             sys.exit(1)
         elif opt in ("-i"):
             input_directory=arg
@@ -633,7 +627,12 @@ if __name__ == "__main__":
             epochs = int(arg)
             if epochs <= 0:
                 raise ValueError("--epochs must be greater than 0.")
+        elif opt == "--exclude-protein-prefix":
+            exclude_protein_prefixes.extend(parse_prefix_filters(arg))
     start = time.time()
+    exclude_protein_prefixes = list(dict.fromkeys(exclude_protein_prefixes))
+    if exclude_protein_prefixes:
+        print("Excluding PSMs whose proteins all match prefixes: " + ", ".join(exclude_protein_prefixes))
     split_mode = bool(target_inputs or decoy_inputs)
     if not split_mode and len(input_directory) == 0:
         raise ValueError("Use -i for embedded-label training or provide both -target and -decoy.")
@@ -647,8 +646,18 @@ if __name__ == "__main__":
     if split_mode:
         if len(target_pickles) == 0 or len(decoy_pickles) == 0:
             raise ValueError("Missing target/decoy pickle inputs.")
-        X_pos, y_pos, group_pos = _load_feature_records(target_pickles, force_label=1, dataset_name="target")
-        X_neg, y_neg, group_neg = _load_feature_records(decoy_pickles, force_label=0, dataset_name="decoy")
+        X_pos, y_pos, group_pos = _load_feature_records(
+            target_pickles,
+            force_label=1,
+            dataset_name="target",
+            exclude_protein_prefixes=exclude_protein_prefixes,
+        )
+        X_neg, y_neg, group_neg = _load_feature_records(
+            decoy_pickles,
+            force_label=0,
+            dataset_name="decoy",
+            exclude_protein_prefixes=exclude_protein_prefixes,
+        )
         X_all = X_pos + X_neg
         y_all = y_pos + y_neg
         group_all = group_pos + group_neg
@@ -656,10 +665,14 @@ if __name__ == "__main__":
     else:
         if len(target_pickles) == 0:
             raise ValueError(f"No feature pickles found under {input_directory}.")
-        L, Yweight, groups = _load_feature_records(target_pickles, dataset_name="embedded")
+        L, Yweight, groups = _load_feature_records(
+            target_pickles,
+            dataset_name="embedded",
+            exclude_protein_prefixes=exclude_protein_prefixes,
+        )
         (X_train, yweight_train), (X_val, yweight_val), (X_test, yweight_test) = split_grouped(L, Yweight, groups)
 
-    X_train, yweight_train, effective_train_decoy_ratio = _prepare_training_pool(
+    X_train, yweight_train = _prepare_training_pool(
         X_train,
         yweight_train,
         dataset_name="train",
@@ -670,5 +683,5 @@ if __name__ == "__main__":
     print("length of training data: " + str(len(X_train)))
     print("length of validation data: " + str(len(X_val)))
     print("length of test data: " + str(len(X_test)))
-    train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test, model_name, pretrained_model, effective_train_decoy_ratio, epochs)
+    train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test, model_name, pretrained_model, epochs)
     print('done')
