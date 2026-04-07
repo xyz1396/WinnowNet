@@ -9,7 +9,6 @@ import getopt
 from datetime import timedelta
 from sklearn import metrics
 import numpy as np
-import glob
 import os
 from components.encoders import PeakEncoder
 from checkpoint_utils import (
@@ -36,6 +35,11 @@ DEFAULT_EVAL_BATCH_SIZE = 128
 DEFAULT_MAX_PEAKS = 300
 DEFAULT_EPOCHS = 50
 DEFAULT_SELECTION_MAX_FDR = 0.01
+PEPTIDE_CANDIDATE_COLUMNS = [
+    "Peptide",
+    "IdentifiedPeptide",
+    "OriginalPeptide",
+]
 
 
 def _label_matches_expected(entry):
@@ -43,6 +47,37 @@ def _label_matches_expected(entry):
     if label is None:
         return True
     return label == 1
+
+
+def _get_entry_peptide_value(row_map):
+    for column in PEPTIDE_CANDIDATE_COLUMNS:
+        peptide_value = str(row_map.get(column, "")).strip()
+        if peptide_value:
+            return peptide_value
+    return ""
+
+
+def _append_manifest_record(record_sink, feature_path, meta, psm_id, row_map, group_key, label):
+    if record_sink is None:
+        return
+
+    source_file = ""
+    if isinstance(meta, dict):
+        source_file = str(meta.get("source_file", "")).strip()
+    if source_file:
+        source_file = os.path.abspath(source_file)
+    else:
+        source_file = os.path.abspath(feature_path)
+
+    record_sink.append(
+        {
+            "label": int(label),
+            "psm_id": str(psm_id),
+            "spectrum_id": str(group_key),
+            "peptide": _get_entry_peptide_value(row_map),
+            "source_file": source_file,
+        }
+    )
 
 
 def _prepare_output_paths(model_name):
@@ -181,7 +216,13 @@ def _select_best_prediction_defaults(y_true, y_scores):
     return best_threshold, best_target_count, best_fdr
 
 
-def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset", exclude_protein_prefixes=None):
+def _load_feature_records(
+    feature_paths,
+    force_label=None,
+    dataset_name="dataset",
+    exclude_protein_prefixes=None,
+    record_sink=None,
+):
     L = []
     Yweight = []
     groups = []
@@ -240,6 +281,15 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
                     L.append(model_input)
                     Yweight.append([1, 1])
                     groups.append(group_key)
+                    _append_manifest_record(
+                        record_sink,
+                        feature_path,
+                        meta,
+                        psm_id,
+                        row_map,
+                        group_key,
+                        1,
+                    )
                     file_groups.add(group_key)
                     positive += 1
                     file_positive += 1
@@ -249,6 +299,15 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
                 L.append(model_input)
                 Yweight.append([0, confidence])
                 groups.append(group_key)
+                _append_manifest_record(
+                    record_sink,
+                    feature_path,
+                    meta,
+                    psm_id,
+                    row_map,
+                    group_key,
+                    0,
+                )
                 file_groups.add(group_key)
                 negative += 1
                 file_negative += 1
@@ -273,10 +332,6 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
     return L, Yweight, groups
 
 
-def _collect_pickles_from_directory(directory):
-    return sorted(glob.glob(os.path.join(directory, "*.pkl")))
-
-
 def _resolve_training_inputs(input_directory, explicit_target, explicit_decoy):
     target_pickles = expand_pickle_inputs(explicit_target)
     decoy_pickles = expand_pickle_inputs(explicit_decoy)
@@ -285,12 +340,7 @@ def _resolve_training_inputs(input_directory, explicit_target, explicit_decoy):
             raise ValueError("Both -target and -decoy must be provided together.")
         return target_pickles, decoy_pickles, True
 
-    pct1_dir = os.path.join(input_directory, "pct1")
-    pct2_dir = os.path.join(input_directory, "pct2")
-    if os.path.isdir(pct1_dir) and os.path.isdir(pct2_dir):
-        return _collect_pickles_from_directory(pct2_dir), _collect_pickles_from_directory(pct1_dir), True
-
-    return _collect_pickles_from_directory(input_directory), [], False
+    return expand_pickle_inputs([input_directory]), [], False
 
 
 def pad_control(data,pairmaxlength):

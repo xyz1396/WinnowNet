@@ -23,12 +23,12 @@ This document describes the current behavior of the rescoring pipeline in this r
 - `script/filtering.py`, `script/filtering_shuffle.py`, `script/sipros_peptides_assembling.py`
 
 ## Dataset convention used now
-Training scripts support dataset folders with:
-- `pct2`: positive PSMs
-- `pct1`: negative PSMs
+Training scripts support either:
+- embedded-label `.pkl` inputs passed with `-i`
+- explicit split-mode inputs passed with `--target` and `--decoy`
 
-Each folder typically contains matched `.tsv` and `.pkl` pairs.
-`script/WinnowNet_Att.py` and `script/WinnowNet_CNN.py` auto-pair files by stem and split into train/val/test.
+Each input directory typically contains matched `.tsv` and `.pkl` pairs.
+`script/WinnowNet_Att.py` and `script/WinnowNet_CNN.py` split records into train/val/test after loading.
 
 ## Feature-generation inputs
 `script/SpectraFeatures.py` consumes:
@@ -174,31 +174,31 @@ For non-CNN mode, keys are reordered to match `D_feature` key order before save.
 ### Generate ATT features
 ```bash
 python script/SpectraFeatures.py \
-  -i /path/pct2/sample_filtered_psms.tsv \
-  -1 /path/pct2/sample.FT1 \
-  -2 /path/pct2/sample.FT2 \
-  -o /path/pct2/sample.pkl \
+  -i /path/target/sample_filtered_psms.tsv \
+  -1 /path/target/sample.FT1 \
+  -2 /path/target/sample.FT2 \
+  -o /path/target/sample.pkl \
   -f att -t 8 -c script/SIP.cfg -d 0.01 -w 10
 ```
 
 ### Generate CNN features with envelope top-5
 ```bash
 python script/SpectraFeatures.py \
-  -i /path/pct2/sample_filtered_psms.tsv \
-  -1 /path/pct2/sample.FT1 \
-  -2 /path/pct2/sample.FT2 \
-  -o /path/pct2/sample.pkl \
+  -i /path/target/sample_filtered_psms.tsv \
+  -1 /path/target/sample.FT1 \
+  -2 /path/target/sample.FT2 \
+  -o /path/target/sample.pkl \
   -f cnn -t 8 -c script/SIP.cfg -d 0.01 -n 5
 ```
 
-### Train ATT model using pct1/pct2 folders
+### Train ATT model using explicit target/decoy inputs
 ```bash
-python script/WinnowNet_Att.py -i /path/sip_example -m model/att.pt -p ""
+python script/WinnowNet_Att.py --target /path/target --decoy /path/decoy -m model/att.pt -p ""
 ```
 
-### Train CNN model using pct1/pct2 folders
+### Train CNN model using explicit target/decoy inputs
 ```bash
-python script/WinnowNet_CNN.py -i /path/sip_example -m model/cnn.pt -p ""
+python script/WinnowNet_CNN.py --target /path/target --decoy /path/decoy -m model/cnn.pt -p ""
 ```
 
 ## Known caveats

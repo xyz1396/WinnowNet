@@ -6,7 +6,6 @@ import time
 from datetime import timedelta
 from sklearn import metrics
 import numpy as np
-import glob
 import sys
 import getopt
 import os
@@ -225,10 +224,6 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
     return L, Yweight, groups
 
 
-def _collect_pickles_from_directory(directory):
-    return sorted(glob.glob(os.path.join(directory, "*.pkl")))
-
-
 def _resolve_training_inputs(input_directory, explicit_target, explicit_decoy):
     target_pickles = expand_pickle_inputs(explicit_target)
     decoy_pickles = expand_pickle_inputs(explicit_decoy)
@@ -237,12 +232,7 @@ def _resolve_training_inputs(input_directory, explicit_target, explicit_decoy):
             raise ValueError("Both -target and -decoy must be provided together.")
         return target_pickles, decoy_pickles, True
 
-    pct1_dir = os.path.join(input_directory, "pct1")
-    pct2_dir = os.path.join(input_directory, "pct2")
-    if os.path.isdir(pct1_dir) and os.path.isdir(pct2_dir):
-        return _collect_pickles_from_directory(pct2_dir), _collect_pickles_from_directory(pct1_dir), True
-
-    return _collect_pickles_from_directory(input_directory), [], False
+    return expand_pickle_inputs([input_directory]), [], False
 
 
 def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
