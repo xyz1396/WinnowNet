@@ -10,9 +10,12 @@ from multiprocessing import get_all_start_methods, get_context
 import numpy as np
 from pkl_utils import PKL_META_KEY, PKL_SCHEMA_VERSION, normalize_long_flag_aliases
 
-DEFAULT_MAX_PEAKS = 300
+DEFAULT_MAX_PEAKS = 128
+CNN_INPUT_CHANNELS = 7
+CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
+NEUTRON_MASS = 1.0033548378
 pairmaxlength = DEFAULT_MAX_PEAKS
-diffDa = 0.01
+diffPPM = 10.0
 
 AA_dict = {
     "G": 57.021464,
@@ -51,8 +54,8 @@ _WORKER_THEORY = None
 _WORKER_FEATURE = None
 _WORKER_SCAN_MAP = None
 _WORKER_MODE = "att"
-_WORKER_FRAGMENT_TOP_N = 3
 _WORKER_MS1_WINDOW_MZ = 10.0
+_WORKER_SIP_CONFIG = None
 
 class peptide:
 
@@ -200,6 +203,128 @@ def _get_field_value(row, field_lookup, aliases, default=""):
     return row.get(field_name, default)
 
 
+def _strip_config_comment(line):
+    return line.split("#", 1)[0].strip()
+
+
+def _parse_config_values(value):
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_sip_config(config_file):
+    element_list = []
+    sip_element = ""
+    residue_composition = {}
+
+    with open(config_file) as fh:
+        for raw_line in fh:
+            line = _strip_config_comment(raw_line)
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            values = _parse_config_values(value)
+            if key == "Element_List":
+                element_list = values
+            elif key == "SIP_Element":
+                sip_element = values[0] if values else value.strip()
+            elif key.startswith("Residue{") and "}" in key:
+                residue = key.split("{", 1)[1].split("}", 1)[0]
+                residue_composition[residue] = [_to_float(item, 0.0) for item in values]
+
+    if not element_list:
+        raise ValueError(f"{config_file} is missing Element_List.")
+    if not sip_element:
+        raise ValueError(f"{config_file} is missing SIP_Element.")
+    if sip_element not in element_list:
+        raise ValueError(
+            f"SIP_Element {sip_element!r} is not present in Element_List from {config_file}."
+        )
+
+    sip_element_index = element_list.index(sip_element)
+    return {
+        "element_list": element_list,
+        "sip_element": sip_element,
+        "sip_element_index": sip_element_index,
+        "residue_composition": residue_composition,
+    }
+
+
+def _residue_sip_atom_count(sip_config, residue, psm_id):
+    residue_composition = sip_config.get("residue_composition", {})
+    if residue not in residue_composition:
+        raise ValueError(
+            f"{psm_id}: residue/PTM symbol {residue!r} is missing from SIP config."
+        )
+    composition = residue_composition[residue]
+    sip_element_index = int(sip_config.get("sip_element_index", -1))
+    if sip_element_index < 0 or sip_element_index >= len(composition):
+        return 0.0
+    return float(composition[sip_element_index])
+
+
+def _sequence_sip_atom_count(sip_config, residues, psm_id):
+    return sum(_residue_sip_atom_count(sip_config, residue, psm_id) for residue in residues)
+
+
+def _residue_mass(residue, psm_id):
+    if residue not in AA_dict:
+        raise ValueError(
+            f"{psm_id}: residue/PTM symbol {residue!r} is missing from AA mass table."
+        )
+    return float(AA_dict[residue])
+
+
+def _build_cnn_ion_metadata(sip_config, peptide_sequence, precursor_charge, precursor_group, psm_id):
+    if sip_config is None:
+        return {}
+
+    peptide_sequence = str(peptide_sequence or "")
+    residues = list(peptide_sequence)
+    residue_masses = [_residue_mass(residue, psm_id) for residue in residues]
+    residue_sip_counts = [
+        _residue_sip_atom_count(sip_config, residue, psm_id)
+        for residue in residues
+    ]
+
+    prefix_masses = [0.0]
+    prefix_sip_counts = [_residue_sip_atom_count(sip_config, "Nterm", psm_id)]
+    for residue_mass, residue_sip_count in zip(residue_masses, residue_sip_counts):
+        prefix_masses.append(prefix_masses[-1] + residue_mass)
+        prefix_sip_counts.append(prefix_sip_counts[-1] + residue_sip_count)
+
+    full_residue_mass = prefix_masses[-1]
+    precursor_neutral_mass = full_residue_mass + N_TERMINUS + C_TERMINUS
+    precursor_sip_atom_count = (
+        prefix_sip_counts[-1] + _residue_sip_atom_count(sip_config, "Cterm", psm_id)
+    )
+    precursor_charge = max(1, int(_to_float(precursor_charge, 1)))
+
+    metadata = {
+        precursor_group: {
+            "mono_mz": (precursor_neutral_mass + precursor_charge * PROTON_MASS)
+            / precursor_charge,
+            "sip_atom_number": precursor_sip_atom_count,
+        }
+    }
+
+    peptide_length = len(residues)
+    for position in range(1, peptide_length + 1):
+        metadata[("b", position)] = {
+            "mono_mz": prefix_masses[position] + H,
+            "sip_atom_number": prefix_sip_counts[position],
+        }
+
+        complement_prefix_position = peptide_length - position
+        metadata[("y", position)] = {
+            "mono_mz": precursor_neutral_mass + PROTON_MASS - prefix_masses[complement_prefix_position],
+            "sip_atom_number": precursor_sip_atom_count
+            - prefix_sip_counts[complement_prefix_position],
+        }
+
+    return metadata
+
+
 def _parse_label_value(value):
     if value is None:
         return None
@@ -344,6 +469,21 @@ def theoryToDict(file_path):
         peaks = [[mz_vals[i], intensity_vals[i]] for i in range(n)]
         return sorted(peaks)
 
+    def _build_fragment_records(mz_vals, intensity_vals, kinds, positions):
+        n = min(len(mz_vals), len(intensity_vals))
+        records = []
+        for idx in range(n):
+            kind = kinds[idx] if idx < len(kinds) else ""
+            position = positions[idx] if idx < len(positions) else 0
+            records.append(
+                {
+                    "peak": [mz_vals[idx], intensity_vals[idx]],
+                    "kind": kind,
+                    "position": position,
+                }
+            )
+        return sorted(records, key=lambda item: item["peak"][0])
+
     def _parse_int_list(line):
         values = []
         for token in line.split():
@@ -372,7 +512,15 @@ def theoryToDict(file_path):
         fragment_positions = _parse_int_list(lines[i + 6])
 
         precursor_scan = _build_peaks(precursor_mz_vals, precursor_int_vals)
-        fragment_scan = _build_peaks(fragment_mz_vals, fragment_int_vals)
+        fragment_records = _build_fragment_records(
+            fragment_mz_vals,
+            fragment_int_vals,
+            fragment_kinds,
+            fragment_positions,
+        )
+        fragment_scan = [record["peak"] for record in fragment_records]
+        fragment_kinds = [record["kind"] for record in fragment_records]
+        fragment_positions = [record["position"] for record in fragment_records]
         all_scan = sorted(precursor_scan + fragment_scan)
 
         theory_dic[psm_id] = {
@@ -579,6 +727,7 @@ def read_tsv(tsv_file, psm_dict, ms2_dict):
             "ms2_scan": scannum,
             "ms1_scan": psm_dict[uniqueID].ms1_scan,
             "charge": charge_int,
+            "peptide_sequence": peptidestr,
             "exp_mass": exp_mass,
             "precursor_mass_charge1": exp_mass + PROTON_MASS if exp_mass > 0 else 0.0,
         }
@@ -608,15 +757,13 @@ def feature_dict(f_dict):
     return D_feature
 
 
-def pad_control_3d(data):
-    data = sorted(data, key=lambda x: x[1], reverse=True)
-    if len(data) > pairmaxlength:
-        data = data[:pairmaxlength]
-    else:
-        while (len(data) < pairmaxlength):
-            data.append([0, 0, 0])
-    data = sorted(data, key=lambda x: x[0])
-    return data
+def pad_control_cnn(data):
+    data = sorted(data, key=lambda x: x["raw_exp_intensity"], reverse=True)[:pairmaxlength]
+    data = sorted(data, key=lambda x: x["features"][0])
+    padded = [item["features"] for item in data]
+    while len(padded) < pairmaxlength:
+        padded.append([0.0] * CNN_INPUT_CHANNELS)
+    return padded
 
 def _to_peak_array(peaks):
     if peaks is None:
@@ -693,36 +840,138 @@ def _group_maxima_from_peak_entries(entries):
     return maxima
 
 
-def _group_maxima_from_matched_exp(x_features):
-    maxima = {}
-    for _, exp_intensity, _, exp_group, _ in x_features:
-        intensity = max(0.0, float(exp_intensity))
-        maxima[exp_group] = max(maxima.get(exp_group, 0.0), intensity)
-    return maxima
+def _build_group_info(entries):
+    group_info = {}
+    for peak, group_key in entries:
+        mz = float(peak[0])
+        intensity = max(0.0, float(peak[1]))
+        info = group_info.setdefault(
+            group_key,
+            {
+                "mono_mz": mz,
+                "theory_max": 0.0,
+            },
+        )
+        info["mono_mz"] = min(info["mono_mz"], mz)
+        info["theory_max"] = max(info["theory_max"], intensity)
+    return group_info
 
 
-def _append_matches(exp_array, theory_array, theory_groups, x_features, exp_group=None):
-    if exp_array.shape[0] == 0 or theory_array.shape[0] == 0:
+def _fragment_entries_in_exp_range(exp_peaks, Xtheory):
+    exp_array = _to_peak_array(exp_peaks)
+    fragment_entries = _fragment_peak_entries(
+        Xtheory.get("fragment", []),
+        Xtheory.get("fragment_kinds", []),
+        Xtheory.get("fragment_positions", []),
+    )
+    if exp_array.shape[0] == 0 or len(fragment_entries) == 0:
+        return []
+    low = float(np.min(exp_array[:, 0]))
+    high = float(np.max(exp_array[:, 0]))
+    return [
+        (peak, group_key)
+        for peak, group_key in fragment_entries
+        if low <= float(peak[0]) <= high
+    ]
+
+
+def _append_cnn_matches(exp_array, theory_entries, matches, source_group):
+    if exp_array.shape[0] == 0 or len(theory_entries) == 0:
         return
-    for mz, theory_group in zip(theory_array, theory_groups):
-        index = np.where(
-            np.logical_and(exp_array[:, 0] > mz[0] - diffDa, exp_array[:, 0] < mz[0] + diffDa)
-        )[0]
-        if len(index) > 0:
-            exp_group_key = theory_group if exp_group is None else exp_group
+    grouped_entries = {}
+    for peak, theory_group in theory_entries:
+        grouped_entries.setdefault(theory_group, []).append(peak)
+
+    for theory_group, peaks in grouped_entries.items():
+        peaks_by_intensity = sorted(peaks, key=lambda x: (-float(x[1]), float(x[0])))
+        for mz in peaks_by_intensity:
+            theory_mz = float(mz[0])
+            tolerance_mz = abs(theory_mz) * diffPPM * 1e-6
+            index = np.where(
+                np.logical_and(
+                    exp_array[:, 0] > theory_mz - tolerance_mz,
+                    exp_array[:, 0] < theory_mz + tolerance_mz,
+                )
+            )[0]
+            if len(index) == 0:
+                break
             for idx in index:
-                x_features.append(
-                    [exp_array[idx][0] - mz[0], exp_array[idx][1], mz[1], exp_group_key, theory_group]
+                exp_mz = float(exp_array[idx][0])
+                matches.append(
+                    {
+                        "expmz": exp_mz,
+                        "delta_mz": exp_mz - theory_mz,
+                        "raw_exp_intensity": max(0.0, float(exp_array[idx][1])),
+                        "theory_intensity": max(0.0, float(mz[1])),
+                        "source_group": source_group,
+                        "theory_group": theory_group,
+                    }
                 )
 
 
-def _normalize_cnn_matches(x_features, exp_group_maxima, theory_group_maxima):
+def _matched_source_maxima(matches):
+    maxima = {}
+    for match in matches:
+        source_group = match["source_group"]
+        maxima[source_group] = max(
+            maxima.get(source_group, 0.0),
+            float(match["raw_exp_intensity"]),
+        )
+    return maxima
+
+
+def _envelope_enrich_ratios(matches, ion_metadata, sip_atom_counts, ion_charges):
+    weighted_sums = {}
+    weight_sums = {}
+    for match in matches:
+        group_key = match["theory_group"]
+        sip_atom_number = float(sip_atom_counts.get(group_key, 0.0))
+        if sip_atom_number <= 0:
+            continue
+        mono_mz = float(ion_metadata.get(group_key, {}).get("mono_mz", 0.0))
+        ion_charge = float(ion_charges.get(group_key, 1))
+        expected_neutron = (float(match["expmz"]) - mono_mz) * ion_charge / NEUTRON_MASS
+        weight = max(0.0, float(match["raw_exp_intensity"]))
+        if weight <= 0:
+            continue
+        weighted_sums[group_key] = weighted_sums.get(group_key, 0.0) + expected_neutron * weight
+        weight_sums[group_key] = weight_sums.get(group_key, 0.0) + weight
+
+    enrich_ratios = {}
+    for group_key, weighted_sum in weighted_sums.items():
+        weight_sum = weight_sums.get(group_key, 0.0)
+        sip_atom_number = float(sip_atom_counts.get(group_key, 0.0))
+        if weight_sum > 0 and sip_atom_number > 0:
+            enrich_ratios[group_key] = (weighted_sum / weight_sum) / sip_atom_number
+        else:
+            enrich_ratios[group_key] = 0.0
+    return enrich_ratios
+
+
+def _normalize_cnn_matches(matches, source_maxima, group_info, ion_metadata, ion_charges):
+    sip_atom_counts = {
+        key: value.get("sip_atom_number", 0.0)
+        for key, value in ion_metadata.items()
+    }
+    enrich_ratios = _envelope_enrich_ratios(
+        matches,
+        ion_metadata,
+        sip_atom_counts,
+        ion_charges,
+    )
     normalized = []
-    for delta_mz, exp_intensity, theory_intensity, exp_group, theory_group in x_features:
-        exp_max = float(exp_group_maxima.get(exp_group, 0.0))
-        theory_max = float(theory_group_maxima.get(theory_group, 0.0))
-        exp_value = max(0.0, float(exp_intensity))
-        theory_value = max(0.0, float(theory_intensity))
+    for match in matches:
+        group_key = match["theory_group"]
+        group_metadata = group_info.get(group_key, {})
+        ion_info = ion_metadata.get(group_key)
+        if ion_info is None:
+            raise ValueError(
+                f"Cannot compute CNN ion metadata for theory group {group_key!r}."
+            )
+        exp_max = float(source_maxima.get(match["source_group"], 0.0))
+        theory_max = float(group_metadata.get("theory_max", 0.0))
+        exp_value = max(0.0, float(match["raw_exp_intensity"]))
+        theory_value = max(0.0, float(match["theory_intensity"]))
         if exp_max > 0:
             exp_value = exp_value / exp_max
         else:
@@ -731,7 +980,20 @@ def _normalize_cnn_matches(x_features, exp_group_maxima, theory_group_maxima):
             theory_value = theory_value / theory_max
         else:
             theory_value = 0.0
-        normalized.append([float(delta_mz), exp_value, theory_value])
+        normalized.append(
+            {
+                "raw_exp_intensity": max(0.0, float(match["raw_exp_intensity"])),
+                "features": [
+                    float(match["expmz"]),
+                    float(match["delta_mz"]),
+                    float(ion_info.get("mono_mz", 0.0)),
+                    exp_value,
+                    theory_value,
+                    float(ion_info.get("sip_atom_number", 0.0)),
+                    float(enrich_ratios.get(group_key, 0.0)),
+                ],
+            }
+        )
     return normalized
 
 
@@ -799,33 +1061,61 @@ def IonExtract(
     ms1_peaks,
     ms2_peaks,
     Xtheory,
-    X_add_feature,
-    fragment_top_n=3,
+    scan_info,
+    sip_config,
+    psm_id,
 ):
     ms1_array = _to_peak_array(ms1_peaks)
     ms2_array = _to_peak_array(ms2_peaks)
     precursor_peaks = Xtheory.get("precursor", [])
     theory_precursor = _to_peak_array(precursor_peaks)
-    precursor_groups = ["precursor"] * theory_precursor.shape[0]
-    trimmed_theory = dict(Xtheory)
-    trimmed_theory["fragment"] = _trim_theory_to_exp_mz_range(ms2_array, Xtheory.get("fragment", []))
-    fragment_entries = _select_fragment_peaks_for_cnn(trimmed_theory, fragment_top_n)
-    theory_fragment = _to_peak_array([peak for peak, _ in fragment_entries])
-    fragment_groups = [group_key for _, group_key in fragment_entries]
-    theory_group_maxima = {
-        "precursor": _max_group_intensity(theory_precursor),
-    }
-    theory_group_maxima.update(_group_maxima_from_peak_entries(fragment_entries))
+    precursor_group = ("precursor", 0)
+    precursor_entries = [
+        (peak, precursor_group)
+        for peak in theory_precursor.tolist()
+    ]
+    fragment_entries = _fragment_entries_in_exp_range(ms2_array, Xtheory)
+    all_theory_entries = precursor_entries + fragment_entries
+    group_info = _build_group_info(all_theory_entries)
 
-    xFeatures = []
-    _append_matches(ms1_array, theory_precursor, precursor_groups, xFeatures, exp_group="precursor")
-    _append_matches(ms2_array, theory_fragment, fragment_groups, xFeatures, exp_group=None)
+    matches = []
+    _append_cnn_matches(ms1_array, precursor_entries, matches, source_group="precursor")
+    _append_cnn_matches(ms2_array, fragment_entries, matches, source_group="fragment")
 
-    exp_group_maxima = _group_maxima_from_matched_exp(xFeatures)
-    xFeatures = _normalize_cnn_matches(xFeatures, exp_group_maxima, theory_group_maxima)
-    xFeatures = np.asarray(pad_control_3d(xFeatures), dtype=float)
+    if len(matches) == 0:
+        xFeatures = np.asarray(pad_control_cnn([]), dtype=float)
+        return [xFeatures.transpose()]
+
+    peptide_sequence = scan_info.get("peptide_sequence", "")
+    precursor_charge = max(1, int(_to_float(scan_info.get("charge", 1), 1)))
+    ion_metadata_all = _build_cnn_ion_metadata(
+        sip_config,
+        peptide_sequence,
+        precursor_charge,
+        precursor_group,
+        psm_id,
+    )
+    ion_metadata = {}
+    ion_charges = {}
+    for group_key in {match["theory_group"] for match in matches}:
+        if group_key not in ion_metadata_all:
+            raise ValueError(
+                f"{psm_id}: cannot compute CNN ion metadata for theory group {group_key!r}."
+            )
+        ion_metadata[group_key] = ion_metadata_all[group_key]
+        ion_charges[group_key] = precursor_charge if group_key == precursor_group else 1
+
+    source_maxima = _matched_source_maxima(matches)
+    xFeatures = _normalize_cnn_matches(
+        matches,
+        source_maxima,
+        group_info,
+        ion_metadata,
+        ion_charges,
+    )
+    xFeatures = np.asarray(pad_control_cnn(xFeatures), dtype=float)
     xFeatures = xFeatures.transpose()
-    return [xFeatures, X_add_feature]
+    return [xFeatures]
 
 
 def IonExtract_Att(
@@ -871,8 +1161,8 @@ def _set_worker_state(
     feature,
     scan_map,
     mode,
-    fragment_top_n,
     ms1_window_mz,
+    sip_config,
 ):
     global _WORKER_EXP_MS1
     global _WORKER_EXP_MS2
@@ -880,8 +1170,8 @@ def _set_worker_state(
     global _WORKER_FEATURE
     global _WORKER_SCAN_MAP
     global _WORKER_MODE
-    global _WORKER_FRAGMENT_TOP_N
     global _WORKER_MS1_WINDOW_MZ
+    global _WORKER_SIP_CONFIG
 
     _WORKER_EXP_MS1 = exp_ms1
     _WORKER_EXP_MS2 = exp_ms2
@@ -889,8 +1179,8 @@ def _set_worker_state(
     _WORKER_FEATURE = feature
     _WORKER_SCAN_MAP = scan_map
     _WORKER_MODE = mode
-    _WORKER_FRAGMENT_TOP_N = fragment_top_n
     _WORKER_MS1_WINDOW_MZ = ms1_window_mz
+    _WORKER_SIP_CONFIG = sip_config
 
 
 def _extract_feature_for_key(key):
@@ -920,8 +1210,9 @@ def _extract_feature_for_key(key):
             ms1_peaks,
             ms2_peaks,
             theory,
-            features,
-            _WORKER_FRAGMENT_TOP_N,
+            scan_info,
+            _WORKER_SIP_CONFIG,
+            key,
         )
     else:
         model_input = IonExtract_Att(
@@ -1020,9 +1311,8 @@ def print_usage():
     print("-c\t Sipros config file for theoretical spectra generator")
     print("-b\t SIP abundance percentage passed to sipros_theoretical_spectra")
     print("-w\t MS1 isolation window size (m/z, default 10)")
-    print("-d\t m/z match tolerance (diffDa, default 0.01 for HRMS)")
-    print("-n\t Top N peaks per fragment envelope for CNN match (default 3)")
-    print("--max-peaks\t Number of top-intensity CNN matched peaks kept (default " + str(DEFAULT_MAX_PEAKS) + ")")
+    print("-d\t m/z match tolerance in ppm (default 10)")
+    print("--max-peaks\t Number of top-intensity matched peaks kept and tensor width (default " + str(DEFAULT_MAX_PEAKS) + ")")
     print("Required input columns: PSMId or SpecId, and Peptide.")
     print("MS2IsotopicAbundances is required unless -b/--sip-abundance is provided.")
 
@@ -1037,7 +1327,6 @@ def _run_single_conversion(
     mode,
     sip_abundance,
     ms1_isolation_window_mz,
-    fragment_env_top_n,
 ):
     start_time = time.time()
     output_dir = os.path.dirname(os.path.abspath(output_file))
@@ -1091,6 +1380,7 @@ def _run_single_conversion(
         psm_dict[psm].get_features()
     D_feature = feature_dict(psm_dict)
     print("Additional features loaded!")
+    sip_config = _parse_sip_config(config_file) if mode == "cnn" else None
 
     worker_count = max(1, int(_to_float(num_cpus, 1)))
     feature_payload = {}
@@ -1104,8 +1394,8 @@ def _run_single_conversion(
         D_feature,
         psm_scan_map,
         mode,
-        fragment_env_top_n,
         ms1_isolation_window_mz,
+        sip_config,
     )
 
     if worker_count == 1:
@@ -1129,8 +1419,8 @@ def _run_single_conversion(
                 D_feature,
                 psm_scan_map,
                 mode,
-                fragment_env_top_n,
                 ms1_isolation_window_mz,
+                sip_config,
             )
         with ctx.Pool(**pool_kwargs) as pool:
             for feature_key, model_input, removed_peak_count in pool.imap_unordered(
@@ -1155,11 +1445,20 @@ def _run_single_conversion(
 
     rows_with_model_input = 0
     rows_without_model_input = 0
+    output_meta = {
+        **table_meta,
+        "mode": mode,
+    }
+    if mode == "cnn":
+        output_meta.update(
+            {
+                "feature_schema": CNN_FEATURE_SCHEMA,
+                "input_channels": CNN_INPUT_CHANNELS,
+                "max_peaks": pairmaxlength,
+            }
+        )
     final_payload = {
-        PKL_META_KEY: {
-            **table_meta,
-            "mode": mode,
-        }
+        PKL_META_KEY: output_meta
     }
     for row_record in row_records:
         psm_id = row_record["psm_id"]
@@ -1199,8 +1498,7 @@ def _build_child_command(
     mode,
     sip_abundance,
     ms1_isolation_window_mz,
-    diff_da,
-    fragment_env_top_n,
+    diff_ppm,
     max_peaks,
 ):
     cmd = [
@@ -1223,9 +1521,7 @@ def _build_child_command(
         "-w",
         str(ms1_isolation_window_mz),
         "-d",
-        str(diff_da),
-        "-n",
-        str(fragment_env_top_n),
+        str(diff_ppm),
         "--max-peaks",
         str(max_peaks),
     ]
@@ -1242,8 +1538,7 @@ def _run_batch_conversions(
     mode,
     sip_abundance,
     ms1_isolation_window_mz,
-    diff_da,
-    fragment_env_top_n,
+    diff_ppm,
     max_peaks,
 ):
     script_path = os.path.abspath(__file__)
@@ -1271,8 +1566,7 @@ def _run_batch_conversions(
                     mode,
                     sip_abundance,
                     ms1_isolation_window_mz,
-                    diff_da,
-                    fragment_env_top_n,
+                    diff_ppm,
                     max_peaks,
                 )
             )
@@ -1309,7 +1603,7 @@ def _run_batch_conversions(
 
 
 def main(argv=None):
-    global diffDa
+    global diffPPM
     global pairmaxlength
     if argv is None:
         argv = sys.argv[1:]
@@ -1325,7 +1619,7 @@ def main(argv=None):
     try:
         opts, _ = getopt.getopt(
             argv,
-            "hi:1:2:o:t:j:f:c:w:d:n:",
+            "hi:1:2:o:t:j:f:c:w:d:",
             ["max-peaks=", "jobs=", "sip-abundance="],
         )
     except Exception:
@@ -1345,7 +1639,6 @@ def main(argv=None):
     num_cpus = str(os.cpu_count() or 1)
     batch_jobs = 1
     ms1_isolation_window_mz = 10.0
-    fragment_env_top_n = 3
     sip_abundance = ""
     pairmaxlength = DEFAULT_MAX_PEAKS
     for opt, arg in opts:
@@ -1373,9 +1666,7 @@ def main(argv=None):
         elif opt in ("-w"):
             ms1_isolation_window_mz = max(0.0, _to_float(arg, 10.0))
         elif opt in ("-d"):
-            diffDa = max(0.0, _to_float(arg, 0.01))
-        elif opt in ("-n"):
-            fragment_env_top_n = max(1, int(_to_float(arg, 3)))
+            diffPPM = max(0.0, _to_float(arg, 10.0))
         elif opt == "--max-peaks":
             pairmaxlength = max(1, int(_to_float(arg, DEFAULT_MAX_PEAKS)))
 
@@ -1401,8 +1692,7 @@ def main(argv=None):
             mode,
             sip_abundance,
             ms1_isolation_window_mz,
-            diffDa,
-            fragment_env_top_n,
+            diffPPM,
             pairmaxlength,
         )
 
@@ -1421,7 +1711,6 @@ def main(argv=None):
         mode,
         sip_abundance,
         ms1_isolation_window_mz,
-        fragment_env_top_n,
     )
 
 

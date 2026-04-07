@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
 import torch.utils.data as Data
 import time
@@ -19,8 +20,8 @@ from pkl_utils import (
     get_entry_label,
     get_entry_label_confidence,
     get_entry_model_input,
+    get_entry_group_key,
     get_entry_row_map,
-    get_entry_spectrum_group_key,
     load_feature_pickle,
     normalize_long_flag_aliases,
     parse_prefix_filters,
@@ -29,7 +30,55 @@ from pkl_utils import (
 
 threshold=0.9
 DEFAULT_EPOCHS = 50
+DEFAULT_TRAIN_BATCH_SIZE = 1024
+DEFAULT_EVAL_BATCH_SIZE = 1024
 DEFAULT_SELECTION_MAX_FDR = 0.01
+CNN_INPUT_CHANNELS = 7
+CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
+MODEL_ARCH_TNET = "tnet"
+MODEL_ARCH_PURE_CNN = "pure_cnn"
+MODEL_ARCH_CHOICES = {MODEL_ARCH_TNET, MODEL_ARCH_PURE_CNN}
+
+
+def _validate_model_arch(model_arch):
+    model_arch = str(model_arch or MODEL_ARCH_TNET).strip().lower()
+    if model_arch not in MODEL_ARCH_CHOICES:
+        raise ValueError(
+            f"Unknown CNN model architecture {model_arch!r}. "
+            f"Choose one of: {', '.join(sorted(MODEL_ARCH_CHOICES))}."
+        )
+    return model_arch
+
+
+def resolve_checkpoint_model_arch(metadata):
+    if metadata is None:
+        return MODEL_ARCH_TNET
+    return _validate_model_arch(metadata.get("model_arch", MODEL_ARCH_TNET))
+
+
+def _validate_cnn_features(features, label="xFeatures"):
+    x_features = np.asarray(features, dtype=float)
+    if x_features.ndim != 2:
+        raise ValueError(
+            f"{label} must be a 2D CNN feature tensor, got ndim={x_features.ndim}."
+        )
+    if x_features.shape[0] != CNN_INPUT_CHANNELS:
+        raise ValueError(
+            f"{label} must have {CNN_INPUT_CHANNELS} channels in the first dimension, "
+            f"got shape={x_features.shape}. Regenerate CNN features with the 7-channel "
+            "SpectraFeatures.py schema; legacy 3-channel CNN features are not supported."
+        )
+    return x_features
+
+
+def _extract_cnn_model_features(model_input, label="xFeatures"):
+    if not isinstance(model_input, (list, tuple)) or len(model_input) != 1:
+        raise ValueError(
+            f"{label}: CNN model_input must be [xFeatures] for the 7-channel schema."
+        )
+    return _validate_cnn_features(model_input[0], label)
+
+
 def _label_matches_expected(entry):
     label = get_entry_label(entry)
     if label is None:
@@ -37,9 +86,39 @@ def _label_matches_expected(entry):
     return label == 1
 
 
-def _load_checkpoint_weights(model_path):
-    state_dict, _ = load_checkpoint_bundle(model_path)
+def _load_checkpoint_weights(model_path, expected_model_arch=None):
+    state_dict, metadata = load_checkpoint_bundle(model_path)
+    if int(metadata.get("input_channels", 0)) != CNN_INPUT_CHANNELS:
+        raise ValueError(
+            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Expected metadata input_channels={CNN_INPUT_CHANNELS}, got "
+            f"{metadata.get('input_channels')!r}. Old 3-channel checkpoints must be retrained."
+        )
+    if metadata.get("feature_schema") != CNN_FEATURE_SCHEMA:
+        raise ValueError(
+            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Expected feature_schema={CNN_FEATURE_SCHEMA!r}, got "
+            f"{metadata.get('feature_schema')!r}. Old 3-channel checkpoints must be retrained."
+        )
+    checkpoint_model_arch = resolve_checkpoint_model_arch(metadata)
+    if expected_model_arch is not None and checkpoint_model_arch != _validate_model_arch(expected_model_arch):
+        raise ValueError(
+            f"Checkpoint {model_path} was trained with model_arch={checkpoint_model_arch!r}, "
+            f"but the requested CNN model architecture is {expected_model_arch!r}."
+        )
     return state_dict
+
+
+def _load_model_state_dict(model, model_path, expected_model_arch=None):
+    try:
+        model.load_state_dict(_load_checkpoint_weights(model_path, expected_model_arch))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load CNN checkpoint {model_path}. This model expects "
+            f"{CNN_INPUT_CHANNELS}-channel inputs and is incompatible with old "
+            "3-channel CNN checkpoints or checkpoints from a different CNN architecture; "
+            "retrain the CNN checkpoint with regenerated 7-channel features and the requested architecture."
+        ) from exc
 
 
 def _prepare_training_pool(X, yweight, dataset_name="train"):
@@ -63,7 +142,17 @@ def _compute_decoy_per_target(yweight):
     return negative / float(positive)
 
 
-def _build_train_loader(train_data, yweight_train):
+def _parse_positive_int(value, flag_name):
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError(f"{flag_name} must be a positive integer.")
+    if parsed <= 0:
+        raise ValueError(f"{flag_name} must be a positive integer.")
+    return parsed
+
+
+def _build_train_loader(train_data, yweight_train, batch_size):
     total_samples = len(yweight_train)
     natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
     target_probability = 1.0 / (1.0 + natural_decoy_per_target)
@@ -73,12 +162,12 @@ def _build_train_loader(train_data, yweight_train):
     print(
         f"[train] input target_count~{target_count} decoy_count~{decoy_count}"
     )
-    return Data.DataLoader(train_data, batch_size=128, num_workers=8, shuffle=True, pin_memory=True)
+    return Data.DataLoader(train_data, batch_size=batch_size, num_workers=8, shuffle=True, pin_memory=True)
 
 
-def _collect_prediction_scores(data, model, loss, device):
+def _collect_prediction_scores(data, model, loss, device, eval_batch_size):
     model.eval()
-    data_loader = Data.DataLoader(data, batch_size=32)
+    data_loader = Data.DataLoader(data, batch_size=eval_batch_size)
     total_loss = 0.0
     y_true = []
     y_scores = []
@@ -160,13 +249,14 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             model_input = get_entry_model_input(entry)
             if model_input is None:
                 continue
+            x_features = _extract_cnn_model_features(model_input, f"{record_key}: xFeatures")
             psm_id = entry.get("psm_id", record_key) if isinstance(entry, dict) else record_key
             row_map = get_entry_row_map(meta, psm_id, entry) if isinstance(entry, dict) else {}
             if proteins_all_match_prefixes(row_map, exclude_protein_prefixes):
                 skipped_excluded_proteins += 1
                 file_skipped_excluded_proteins += 1
                 continue
-            group_key = get_entry_spectrum_group_key(meta, psm_id, entry)
+            group_key = get_entry_group_key(meta, psm_id, entry)
 
             if force_label is None:
                 label = get_entry_label(entry)
@@ -188,7 +278,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
 
             if label == 1:
                 if confidence > threshold:
-                    L.append(model_input[0])
+                    L.append(x_features)
                     Yweight.append([1, 1])
                     groups.append(group_key)
                     file_groups.add(group_key)
@@ -197,7 +287,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
                     kept_rows += 1
                     file_kept_rows += 1
             else:
-                L.append(model_input[0])
+                L.append(x_features)
                 Yweight.append([0, confidence])
                 groups.append(group_key)
                 file_groups.add(group_key)
@@ -275,7 +365,7 @@ def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
     val_groups = {groups[i] for i in val_idx}
     test_groups = {groups[i] for i in test_idx}
     print(
-        "[split] grouped by spectrum; "
+        "[split] grouped by peptide; "
         f"total_groups={len(group_to_indices)} "
         f"train_groups={len(train_groups)} val_groups={len(val_groups)} test_groups={len(test_groups)}"
     )
@@ -292,18 +382,10 @@ class DefineDataset(Data.Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        mz = self.X[idx][0]
-        exp = self.X[idx][1]
-        theory = self.X[idx][2]
+        xFeatures = _validate_cnn_features(self.X[idx], f"sample {idx} xFeatures")
         y = self.yweight[idx][0]
         weight = self.yweight[idx][1]
 
-        xFeatures=[]
-        for i in range(len(mz)):
-            xFeatures.append([mz[i],exp[i],theory[i]])
-
-        xFeatures=np.asarray(xFeatures,dtype=float)
-        xFeatures = xFeatures.transpose()
         xFeatures = torch.FloatTensor(xFeatures)
 
         return xFeatures, y, weight
@@ -351,10 +433,10 @@ class T_Net(nn.Module):
 class Transform(nn.Module):
     def __init__(self):
         super().__init__()
-        self.stn = T_Net(k=3)
+        self.stn = T_Net(k=CNN_INPUT_CHANNELS)
         self.fstn = T_Net(k=64)
 
-        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv1 = nn.Conv1d(CNN_INPUT_CHANNELS, 64, 1)
         self.conv2 = nn.Conv1d(64, 128, 1)
         self.conv3 = nn.Conv1d(128, 1024, 1)
 
@@ -364,9 +446,9 @@ class Transform(nn.Module):
 
     def forward(self, x):
         n_pts = x.size()[2]
-        trans = self.stn(x)
+        input_transform = self.stn(x)
         x = x.transpose(2, 1)
-        x = torch.bmm(x, trans)
+        x = torch.bmm(x, input_transform)
         x = x.transpose(2, 1)
         x = F.relu(self.bn1(self.conv1(x)))
 
@@ -382,7 +464,7 @@ class Transform(nn.Module):
         x = torch.max(x, 2, keepdim=True)[0]
         x = x.view(-1, 1024)
 
-        return x, trans, trans_feat
+        return x, input_transform, trans_feat
 
 
 
@@ -398,11 +480,53 @@ class Net(nn.Module):
         self.bn2 = nn.BatchNorm1d(256)
 
     def forward(self, x):
-        x, matrix3x3, matrix64x64 = self.transform(x)
+        x, input_transform, feature_transform = self.transform(x)
         x = F.relu(self.bn1(self.fc1(x)))
         x = F.relu(self.bn2(self.dropout(self.fc2(x))))
         output = self.fc3(x)
         return output
+
+
+class PureCNNNet(nn.Module):
+    def __init__(self):
+        super(PureCNNNet, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(CNN_INPUT_CHANNELS, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x_max = torch.max(x, dim=2)[0]
+        x_mean = torch.mean(x, dim=2)
+        x = torch.cat([x_max, x_mean], dim=1)
+        return self.classifier(x)
+
+
+def build_cnn_model(model_arch=MODEL_ARCH_TNET):
+    model_arch = _validate_model_arch(model_arch)
+    if model_arch == MODEL_ARCH_PURE_CNN:
+        return PureCNNNet()
+    return Net()
+
+
+def count_trainable_parameters(model):
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
 
 def get_time_dif(start_time):
     end_time = time.time()
@@ -410,11 +534,11 @@ def get_time_dif(start_time):
     return timedelta(seconds=int(round(time_dif)))
 
 
-def evaluate(data, model, loss, device):
+def evaluate(data, model, loss, device, eval_batch_size):
     # Evaluation, return accuracy and loss
 
     model.eval()  # set mode to evaluation to disable dropout
-    data_loader = Data.DataLoader(data,batch_size=32)
+    data_loader = Data.DataLoader(data, batch_size=eval_batch_size)
 
     data_len = len(data)
     total_loss = 0.0
@@ -450,15 +574,15 @@ def _format_checkpoint_label(model_path):
     return base_name
 
 
-def test_model(model, test_data, device, model_str):
+def test_model(model, test_data, device, model_str, model_arch, eval_batch_size):
     print("Testing...")
     print("Checkpoint: " + _format_checkpoint_label(model_str))
     print("Checkpoint path: " + os.path.abspath(model_str))
     model.eval()
     start_time = time.time()
-    test_loader = Data.DataLoader(test_data,batch_size=32)
+    test_loader = Data.DataLoader(test_data, batch_size=eval_batch_size)
 
-    model.load_state_dict(_load_checkpoint_weights(model_str))
+    _load_model_state_dict(model, model_str, model_arch)
 
     y_true, y_pred, y_pred_prob = [], [], []
     for data1,label, weight in test_loader:
@@ -489,20 +613,39 @@ def test_model(model, test_data, device, model_str):
     print("Time usage:", get_time_dif(start_time))
 
 
-def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test,model_name,pretrained_model, epochs):
+def train_model(
+    X_train,
+    X_val,
+    X_test,
+    yweight_train,
+    yweight_val,
+    yweight_test,
+    model_name,
+    pretrained_model,
+    epochs,
+    model_arch,
+    train_batch_size,
+    eval_batch_size,
+):
     LR = 1e-3
     train_data = DefineDataset(X_train, yweight_train)
     val_data = DefineDataset(X_val, yweight_val)
     test_data = DefineDataset(X_test, yweight_test)
     os.makedirs("checkpoints", exist_ok=True)
     device = torch.device("cuda")
-    model = Net()
+    model_arch = _validate_model_arch(model_arch)
+    model = build_cnn_model(model_arch)
+    trainable_parameter_count = count_trainable_parameters(model)
+    print("CNN model architecture: " + model_arch)
+    print("Trainable parameters: " + str(trainable_parameter_count))
+    print("Train batch size: " + str(train_batch_size))
+    print("Eval batch size: " + str(eval_batch_size))
     model.cuda()
     model = nn.DataParallel(model)
     model.to(device)
     if len(pretrained_model)>0:
         print("loading pretrained_model")
-        model.load_state_dict(_load_checkpoint_weights(pretrained_model))
+        _load_model_state_dict(model, pretrained_model, model_arch)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     #model.load_state_dict(
@@ -510,7 +653,7 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
     #test_model(model, test_data, device)
     best_loss = 10000
     print("Epochs: " + str(epochs))
-    train_loader = _build_train_loader(train_data, yweight_train)
+    train_loader = _build_train_loader(train_data, yweight_train, train_batch_size)
     checkpoint_paths = []
     for epoch in range(0, epochs):
         start_time = time.time()
@@ -528,9 +671,15 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
             # backward propagation and update parameters
             loss.backward()
             optimizer.step()
-        train_acc, train_loss, train_Posprec, train_Negprec = evaluate(train_data, model, criterion, device)
-        val_acc, val_loss, val_PosPrec, val_Negprec = evaluate(val_data, model, criterion, device)
-        _, val_y_true, val_y_scores = _collect_prediction_scores(val_data, model, criterion, device)
+        train_acc, train_loss, train_Posprec, train_Negprec = evaluate(
+            train_data, model, criterion, device, eval_batch_size
+        )
+        val_acc, val_loss, val_PosPrec, val_Negprec = evaluate(
+            val_data, model, criterion, device, eval_batch_size
+        )
+        _, val_y_true, val_y_scores = _collect_prediction_scores(
+            val_data, model, criterion, device, eval_batch_size
+        )
         best_threshold, best_target_count, best_val_fdr = _select_best_prediction_defaults(
             val_y_true,
             val_y_scores,
@@ -538,6 +687,10 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
         checkpoint_metadata = build_checkpoint_metadata(
             model_type="cnn",
             best_decision_threshold=best_threshold,
+            input_channels=CNN_INPUT_CHANNELS,
+            feature_schema=CNN_FEATURE_SCHEMA,
+            model_arch=model_arch,
+            trainable_parameter_count=trainable_parameter_count,
         )
         checkpoint_path = 'checkpoints/epoch' + str(epoch) + '.pt'
         save_checkpoint_bundle(checkpoint_path, model.state_dict(), checkpoint_metadata)
@@ -555,7 +708,7 @@ def train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test
 
     print("Best model path: " + model_name)
     for checkpoint_path in checkpoint_paths:
-        test_model(model, test_data, device, checkpoint_path)
+        test_model(model, test_data, device, checkpoint_path, model_arch, eval_batch_size)
 
 
 
@@ -566,11 +719,26 @@ if __name__ == "__main__":
             "-target": "--target",
             "-decoy": "--decoy",
             "-epochs": "--epochs",
+            "-train-batch-size": "--train-batch-size",
+            "-eval-batch-size": "--eval-batch-size",
             "-exclude-protein-prefix": "--exclude-protein-prefix",
+            "-model-arch": "--model-arch",
         },
     )
     try:
-        opts, args = getopt.getopt(argv, "hi:m:p:t:", ["target=", "decoy=", "epochs=", "exclude-protein-prefix="])
+        opts, args = getopt.getopt(
+            argv,
+            "hi:m:p:t:",
+            [
+                "target=",
+                "decoy=",
+                "epochs=",
+                "train-batch-size=",
+                "eval-batch-size=",
+                "exclude-protein-prefix=",
+                "model-arch=",
+            ],
+        )
     except:
         print("Error Option, using -h for help information.")
         sys.exit(1)
@@ -582,6 +750,9 @@ if __name__ == "__main__":
         print("-target\t Target feature pickle(s), comma-separated or repeated\n")
         print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
         print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
+        print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
+        print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
+        print("--model-arch\t CNN architecture: tnet or pure_cnn (default: " + MODEL_ARCH_TNET + ")\n")
         print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
         sys.exit(1)
         start_time=time.time()
@@ -592,6 +763,9 @@ if __name__ == "__main__":
     exclude_protein_prefixes = []
     target_inputs = []
     decoy_inputs = []
+    model_arch = MODEL_ARCH_TNET
+    train_batch_size = DEFAULT_TRAIN_BATCH_SIZE
+    eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
     for opt, arg in opts:
         if opt in ("-h"):
             print("\n\nUsage:\n")
@@ -601,6 +775,9 @@ if __name__ == "__main__":
             print("-target\t Target feature pickle(s), comma-separated or repeated\n")
             print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
             print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
+            print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
+            print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
+            print("--model-arch\t CNN architecture: tnet or pure_cnn (default: " + MODEL_ARCH_TNET + ")\n")
             print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
             sys.exit(1)
         elif opt in ("-i"):
@@ -614,9 +791,13 @@ if __name__ == "__main__":
         elif opt == "--decoy":
             decoy_inputs.append(arg)
         elif opt == "--epochs":
-            epochs = int(arg)
-            if epochs <= 0:
-                raise ValueError("--epochs must be greater than 0.")
+            epochs = _parse_positive_int(arg, "--epochs")
+        elif opt == "--train-batch-size":
+            train_batch_size = _parse_positive_int(arg, "--train-batch-size")
+        elif opt == "--eval-batch-size":
+            eval_batch_size = _parse_positive_int(arg, "--eval-batch-size")
+        elif opt == "--model-arch":
+            model_arch = _validate_model_arch(arg)
         elif opt == "--exclude-protein-prefix":
             exclude_protein_prefixes.extend(parse_prefix_filters(arg))
     start = time.time()
@@ -673,5 +854,18 @@ if __name__ == "__main__":
     print("length of training data: " + str(len(X_train)))
     print("length of validation data: " + str(len(X_val)))
     print("length of test data: " + str(len(X_test)))
-    train_model(X_train, X_val, X_test, yweight_train, yweight_val, yweight_test, model_name, pretrained_model, epochs)
+    train_model(
+        X_train,
+        X_val,
+        X_test,
+        yweight_train,
+        yweight_val,
+        yweight_test,
+        model_name,
+        pretrained_model,
+        epochs,
+        model_arch,
+        train_batch_size,
+        eval_batch_size,
+    )
     print('done')

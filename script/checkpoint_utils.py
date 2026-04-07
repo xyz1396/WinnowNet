@@ -45,6 +45,10 @@ def build_checkpoint_metadata(
     model_type,
     best_decision_threshold,
     max_peaks=None,
+    input_channels=None,
+    feature_schema=None,
+    model_arch=None,
+    trainable_parameter_count=None,
 ):
     metadata = {
         "model_type": model_type,
@@ -52,6 +56,14 @@ def build_checkpoint_metadata(
     }
     if max_peaks is not None:
         metadata["max_peaks"] = int(max_peaks)
+    if input_channels is not None:
+        metadata["input_channels"] = int(input_channels)
+    if feature_schema is not None:
+        metadata["feature_schema"] = str(feature_schema)
+    if model_arch is not None:
+        metadata["model_arch"] = str(model_arch)
+    if trainable_parameter_count is not None:
+        metadata["trainable_parameter_count"] = int(trainable_parameter_count)
     return metadata
 
 

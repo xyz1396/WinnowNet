@@ -46,8 +46,8 @@ Each input directory typically contains matched `.tsv` and `.pkl` pairs.
 - `-f`: mode (`cnn` or `att`, default `att`)
 - `-c`: Sipros config
 - `-w`: MS1 isolation window size in m/z for ATT MS1 filtering (default `10.0`)
-- `-d`: peak match tolerance `diffDa` in m/z (default `0.01`, HRMS-oriented)
-- `-n`: CNN only, top N peaks per fragment envelope (default `3`)
+- `-d`: peak match tolerance in ppm (default `10`)
+- `--max-peaks`: peak count control used by CNN feature generation and ATT/CNN model input padding
 
 ## Experimental spectra parsing (`FTtoDict`)
 `FTtoDict` is used for both FT1 and FT2.
@@ -115,26 +115,27 @@ Matching process:
 1. Match MS1 peaks against theoretical precursor peaks.
 2. Trim theoretical fragment peaks to the observed experimental MS2 m/z range.
 3. Match MS2 peaks against the trimmed theoretical fragment peaks.
-4. Fragment peaks are first filtered by envelope metadata:
-- group by `(fragment_kind, fragment_position)`
-- keep top `n` by theoretical intensity in each group (`-n`, default `3`)
+4. Preserve precursor and b/y isotope-envelope metadata.
+5. Within each precursor or b/y isotope envelope, try theoretical peaks from highest to lowest theoretical intensity.
+6. Stop matching lower-intensity peaks in that envelope as soon as a higher-intensity theoretical peak has no real match.
+7. Select the final top `--max-peaks` matched peaks by raw real intensity.
 
-Each match yields one triplet feature:
-- `[delta_mz, experimental_intensity, theoretical_intensity]`
+Each match yields one 7-channel feature:
+- `[expmz, delta_mz, mono_mz, experimental_intensity, theoretical_intensity, SIPatomNumber, EnrichRatio]`
 
 Post-processing:
-- pad/truncate to `pairmaxlength=500`
-- normalize precursor matches within the precursor group
-- normalize fragment matches within each `(fragment_kind, fragment_position)` group
-  for experimental and theoretical channels
-- transpose to shape `[3, pairmaxlength]`
+- pad/truncate to `--max-peaks` (default `128`)
+- normalize precursor real intensity within matched precursor peaks
+- normalize fragment real intensity within matched MS2 fragment peaks
+- normalize theoretical intensity within each precursor or b/y isotope envelope
+- repeat one `EnrichRatio` value across all matched peaks in the same isotope envelope
+- transpose to shape `[7, --max-peaks]`
 
 Output entry in feature pickle (CNN path):
-- `[xFeatures, X_add_feature]`
+- `[xFeatures]`
 
 Current CNN trainer usage (`script/WinnowNet_CNN.py`):
-- uses only `D_features[j][0]` (`xFeatures`)
-- ignores `X_add_feature`
+- consumes `D_features[j][0]` (`xFeatures`) directly as a 7-channel tensor
 
 ## Attention feature construction (`IonExtract_Att`)
 Used when `-f att`.
@@ -160,11 +161,11 @@ Current ATT trainer usage (`script/WinnowNet_Att.py`):
 ## What is parsed but currently not used in model input
 - `precursor_abundant_mz` (used for ATT MS1 window center only)
 - `fragment_kinds` / `fragment_positions`:
-  - used in CNN preprocessing for top-`n` envelope filtering
-  - not directly fed as model tensors
+  - used to build CNN envelope-level metadata
+  - not directly fed as separate model tensors
 
 ## Output pickle schema summary
-- `cnn` mode: `dict[PSMId] = [xFeatures, X_add_feature]`
+- `cnn` mode: `dict[PSMId] = [xFeatures]`
 - `att` mode: `dict[PSMId] = [Xexp, Xtheory]`
 
 For non-CNN mode, keys are reordered to match `D_feature` key order before save.
@@ -178,17 +179,17 @@ python script/SpectraFeatures.py \
   -1 /path/target/sample.FT1 \
   -2 /path/target/sample.FT2 \
   -o /path/target/sample.pkl \
-  -f att -t 8 -c script/SIP.cfg -d 0.01 -w 10
+  -f att -t 8 -c script/SIP.cfg -d 10 -w 10
 ```
 
-### Generate CNN features with envelope top-5
+### Generate CNN features with 128 matched peaks
 ```bash
 python script/SpectraFeatures.py \
   -i /path/target/sample_filtered_psms.tsv \
   -1 /path/target/sample.FT1 \
   -2 /path/target/sample.FT2 \
   -o /path/target/sample.pkl \
-  -f cnn -t 8 -c script/SIP.cfg -d 0.01 -n 5
+  -f cnn -t 8 -c script/SIP.cfg -d 10 --max-peaks 128
 ```
 
 ### Train ATT model using explicit target/decoy inputs

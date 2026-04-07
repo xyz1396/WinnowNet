@@ -45,6 +45,7 @@ note.md
 *.log
 test/*.png
 test/*.pdf
+test/*.tsv
 data
 
 # OS files

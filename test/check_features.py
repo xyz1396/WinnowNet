@@ -12,6 +12,7 @@ except ModuleNotFoundError:
 
 
 META_KEY = "__meta__"
+DEFAULT_CNN_CHANNELS = 7
 
 
 def unwrap_entry(value: Any) -> Any:
@@ -25,14 +26,17 @@ def detect_mode(values: Iterable[Any]) -> str:
         value = unwrap_entry(value)
         if value is None:
             continue
-        if not isinstance(value, (list, tuple)) or len(value) != 2:
+        if not isinstance(value, (list, tuple)):
             continue
-        first = np.asarray(value[0])
-        second = np.asarray(value[1])
-        if first.ndim == 2 and first.shape[0] == 3 and second.ndim == 1:
-            return "cnn"
-        if first.ndim == 2 and second.ndim == 2 and first.shape[1] == 2 and second.shape[1] == 2:
-            return "att"
+        if len(value) == 1:
+            first = np.asarray(value[0])
+            if first.ndim == 2 and first.shape[0] == DEFAULT_CNN_CHANNELS:
+                return "cnn"
+        elif len(value) == 2:
+            first = np.asarray(value[0])
+            second = np.asarray(value[1])
+            if first.ndim == 2 and second.ndim == 2 and first.shape[1] == 2 and second.shape[1] == 2:
+                return "att"
     return "unknown"
 
 
@@ -45,30 +49,27 @@ def validate_cnn_entry(
     key: str,
     value: Any,
     expected_len: int,
-    expected_add_len: int,
+    expected_channels: int,
 ) -> Tuple[List[str], List[str], Dict[str, float]]:
     errors: List[str] = []
     warnings: List[str] = []
     stats: Dict[str, float] = {}
 
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        return [f"{key}: entry is not [xFeatures, X_add_feature]."], warnings, stats
+    if not isinstance(value, (list, tuple)) or len(value) != 1:
+        return [f"{key}: entry is not [xFeatures]."], warnings, stats
 
     try:
         x_features = np.asarray(value[0], dtype=float)
     except Exception as exc:
         return [f"{key}: xFeatures cannot be converted to float array ({exc})."], warnings, stats
 
-    try:
-        x_add = np.asarray(value[1], dtype=float)
-    except Exception as exc:
-        return [f"{key}: X_add_feature cannot be converted to float array ({exc})."], warnings, stats
-
     if x_features.ndim != 2:
         errors.append(f"{key}: xFeatures must be 2D, got ndim={x_features.ndim}.")
     else:
-        if x_features.shape[0] != 3:
-            errors.append(f"{key}: xFeatures first dimension must be 3, got {x_features.shape[0]}.")
+        if expected_channels > 0 and x_features.shape[0] != expected_channels:
+            errors.append(
+                f"{key}: xFeatures first dimension must be {expected_channels}, got {x_features.shape[0]}."
+            )
         if expected_len > 0 and x_features.shape[1] != expected_len:
             errors.append(
                 f"{key}: xFeatures second dimension should be {expected_len}, got {x_features.shape[1]}."
@@ -77,23 +78,6 @@ def validate_cnn_entry(
         non_zero = np.count_nonzero(np.any(np.abs(x_features) > 0, axis=0))
         stats["non_zero_pairs"] = float(non_zero)
         _finite_check(x_features, f"{key}: xFeatures", errors)
-
-    if x_add.ndim != 1:
-        errors.append(f"{key}: X_add_feature must be 1D, got ndim={x_add.ndim}.")
-    else:
-        if expected_add_len > 0 and x_add.shape[0] != expected_add_len:
-            errors.append(
-                f"{key}: X_add_feature length should be {expected_add_len}, got {x_add.shape[0]}."
-            )
-        _finite_check(x_add, f"{key}: X_add_feature", errors)
-        if x_add.shape[0] >= 3:
-            charge_one_hot = x_add[-3:]
-            if not np.all(np.isin(charge_one_hot, [0.0, 1.0])):
-                warnings.append(f"{key}: charge one-hot tail contains values outside {{0,1}}.")
-            if not np.isclose(charge_one_hot.sum(), 1.0):
-                warnings.append(
-                    f"{key}: charge one-hot tail sums to {charge_one_hot.sum():.3f}, expected 1.0."
-                )
 
     return errors, warnings, stats
 
@@ -165,14 +149,20 @@ def main() -> int:
     parser.add_argument(
         "--expected-pair-length",
         type=int,
-        default=500,
+        default=128,
         help="Expected CNN xFeatures second dimension.",
+    )
+    parser.add_argument(
+        "--expected-channel-count",
+        type=int,
+        default=DEFAULT_CNN_CHANNELS,
+        help="Expected CNN xFeatures first dimension.",
     )
     parser.add_argument(
         "--expected-additional-length",
         type=int,
-        default=11,
-        help="Expected CNN X_add_feature length.",
+        default=0,
+        help="Deprecated; ignored for the 7-channel CNN [xFeatures] schema.",
     )
     parser.add_argument(
         "--show-errors",
@@ -240,7 +230,7 @@ def main() -> int:
                 str(key),
                 value,
                 args.expected_pair_length,
-                args.expected_additional_length,
+                args.expected_channel_count,
             )
             pair_counts.extend([stats["pair_count"]] if "pair_count" in stats else [])
             non_zero_counts.extend([stats["non_zero_pairs"]] if "non_zero_pairs" in stats else [])

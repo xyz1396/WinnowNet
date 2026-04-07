@@ -2,12 +2,13 @@ import csv
 import getopt
 import sys
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data as Data
 from torch.autograd import Variable
 
-from WinnowNet_CNN import Net
+from WinnowNet_CNN import build_cnn_model, resolve_checkpoint_model_arch
 from checkpoint_utils import load_checkpoint_bundle
 from pkl_utils import (
     choose_output_column,
@@ -19,8 +20,33 @@ from pkl_utils import (
     normalize_long_flag_aliases,
 )
 
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_BATCH_SIZE = 1024
 DEFAULT_DECISION_THRESHOLD = 0.5
+CNN_INPUT_CHANNELS = 7
+CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
+
+
+def _validate_cnn_features(features, label="xFeatures"):
+    x_features = np.asarray(features, dtype=float)
+    if x_features.ndim != 2:
+        raise ValueError(
+            f"{label} must be a 2D CNN feature tensor, got ndim={x_features.ndim}."
+        )
+    if x_features.shape[0] != CNN_INPUT_CHANNELS:
+        raise ValueError(
+            f"{label} must have {CNN_INPUT_CHANNELS} channels in the first dimension, "
+            f"got shape={x_features.shape}. Regenerate CNN features with the 7-channel "
+            "SpectraFeatures.py schema; legacy 3-channel CNN features are not supported."
+        )
+    return x_features
+
+
+def _extract_cnn_model_features(model_input, label="xFeatures"):
+    if not isinstance(model_input, (list, tuple)) or len(model_input) != 1:
+        raise ValueError(
+            f"{label}: CNN model_input must be [xFeatures] for the 7-channel schema."
+        )
+    return _validate_cnn_features(model_input[0], label)
 
 
 class DefineDataset(Data.Dataset):
@@ -44,9 +70,39 @@ def _qvalue_to_string(qvalue):
     return f"{float(qvalue):.10g}"
 
 
-def _load_checkpoint_weights(model_path):
-    state_dict, _ = load_checkpoint_bundle(model_path)
+def _load_checkpoint_weights(model_path, expected_model_arch=None):
+    state_dict, metadata = load_checkpoint_bundle(model_path)
+    if int(metadata.get("input_channels", 0)) != CNN_INPUT_CHANNELS:
+        raise ValueError(
+            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Expected metadata input_channels={CNN_INPUT_CHANNELS}, got "
+            f"{metadata.get('input_channels')!r}. Old 3-channel checkpoints must be retrained."
+        )
+    if metadata.get("feature_schema") != CNN_FEATURE_SCHEMA:
+        raise ValueError(
+            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Expected feature_schema={CNN_FEATURE_SCHEMA!r}, got "
+            f"{metadata.get('feature_schema')!r}. Old 3-channel checkpoints must be retrained."
+        )
+    checkpoint_model_arch = resolve_checkpoint_model_arch(metadata)
+    if expected_model_arch is not None and checkpoint_model_arch != expected_model_arch:
+        raise ValueError(
+            f"Checkpoint {model_path} was trained with model_arch={checkpoint_model_arch!r}, "
+            f"but prediction constructed {expected_model_arch!r}."
+        )
     return state_dict
+
+
+def _load_model_state_dict(model, model_path, expected_model_arch=None):
+    try:
+        model.load_state_dict(_load_checkpoint_weights(model_path, expected_model_arch))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load CNN checkpoint {model_path}. This model expects "
+            f"{CNN_INPUT_CHANNELS}-channel inputs and is incompatible with old "
+            "3-channel CNN checkpoints or checkpoints from a different CNN architecture; "
+            "retrain the CNN checkpoint with regenerated 7-channel features and the requested architecture."
+        ) from exc
 
 
 def _load_checkpoint_metadata(model_path):
@@ -61,6 +117,16 @@ def _parse_probability(value, flag_name):
         raise ValueError(f"{flag_name} must be a float between 0 and 1.")
     if parsed < 0.0 or parsed > 1.0:
         raise ValueError(f"{flag_name} must be between 0 and 1.")
+    return parsed
+
+
+def _parse_positive_int(value, flag_name):
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError(f"{flag_name} must be a positive integer.")
+    if parsed <= 0:
+        raise ValueError(f"{flag_name} must be a positive integer.")
     return parsed
 
 
@@ -90,10 +156,10 @@ def _compute_qvalues(scores, labels):
     return qvalues
 
 
-def _predict_scores(model, model_name, feature_batches, device, batch_size, decision_threshold):
+def _predict_scores(model, model_name, feature_batches, device, batch_size, decision_threshold, model_arch):
     test_data = DefineDataset(feature_batches)
     test_loader = Data.DataLoader(test_data, batch_size=batch_size)
-    model.load_state_dict(_load_checkpoint_weights(model_name))
+    _load_model_state_dict(model, model_name, model_arch)
     model.eval()
 
     y_pred_prob = []
@@ -121,8 +187,9 @@ def _load_prediction_rows(input_file):
         model_input = get_entry_model_input(entry)
         if model_input is None:
             continue
+        x_features = _extract_cnn_model_features(model_input, f"{key}: xFeatures")
         feature_keys.append(key)
-        feature_batches.append(model_input[0])
+        feature_batches.append(x_features)
 
     return meta, ordered_items, feature_keys, feature_batches
 
@@ -220,9 +287,7 @@ if __name__ == "__main__":
         elif opt in ("-o"):
             output_file = arg
         elif opt == "--batch-size":
-            batch_size = int(arg)
-            if batch_size <= 0:
-                raise ValueError("--batch-size must be greater than 0.")
+            batch_size = _parse_positive_int(arg, "--batch-size")
         elif opt == "--decision-threshold":
             decision_threshold = _parse_probability(arg, "--decision-threshold")
 
@@ -230,6 +295,10 @@ if __name__ == "__main__":
     if len(meta.get("columns", [])) == 0:
         raise ValueError("Input pickle does not contain the original TSV/PIN row metadata.")
     checkpoint_metadata = _load_checkpoint_metadata(model_name)
+    model_arch = resolve_checkpoint_model_arch(checkpoint_metadata)
+    print("Using CNN model architecture from checkpoint: " + model_arch)
+    if "trainable_parameter_count" in checkpoint_metadata:
+        print("Checkpoint trainable parameters: " + str(checkpoint_metadata["trainable_parameter_count"]))
     best_threshold = float(checkpoint_metadata["best_decision_threshold"])
     if decision_threshold is None:
         decision_threshold = best_threshold
@@ -238,7 +307,7 @@ if __name__ == "__main__":
         print("WARNING: --decision-threshold " + str(decision_threshold) + " differs from checkpoint best " + str(best_threshold))
 
     device = torch.device("cuda")
-    model = Net()
+    model = build_cnn_model(model_arch)
     model.cuda()
     model = nn.DataParallel(model)
     model.to(device)
@@ -250,6 +319,7 @@ if __name__ == "__main__":
         device,
         batch_size,
         decision_threshold,
+        model_arch,
     )
     score_map = {key: score for key, score in zip(feature_keys, predicted_scores)}
     predicted_label_map = {key: label for key, label in zip(feature_keys, predicted_labels)}
