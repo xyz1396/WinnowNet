@@ -1,5 +1,6 @@
 import csv
 import getopt
+import os
 import sys
 
 import numpy as np
@@ -12,6 +13,7 @@ from WinnowNet_CNN import build_cnn_model, resolve_checkpoint_model_arch
 from checkpoint_utils import load_checkpoint_bundle
 from pkl_utils import (
     choose_output_column,
+    expand_pickle_inputs,
     format_label_value,
     get_entry_model_input,
     get_entry_row_index,
@@ -24,6 +26,9 @@ DEFAULT_BATCH_SIZE = 1024
 DEFAULT_DECISION_THRESHOLD = 0.5
 CNN_INPUT_CHANNELS = 7
 CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
+CNN_ENRICH_RATIO_CHANNEL = 6
+MS2_ISOTOPIC_ABUNDANCE_COLUMN = "MS2IsotopicAbundances"
+MS2_ENRICH_RATIO_MEDIAN_COLUMN = "MS2isotopicAbundanceEvolopeMedian"
 
 
 def _validate_cnn_features(features, label="xFeatures"):
@@ -47,6 +52,42 @@ def _extract_cnn_model_features(model_input, label="xFeatures"):
             f"{label}: CNN model_input must be [xFeatures] for the 7-channel schema."
         )
     return _validate_cnn_features(model_input[0], label)
+
+
+def _format_feature_value(value):
+    if value == "":
+        return ""
+    if not np.isfinite(float(value)):
+        return ""
+    return f"{float(value):.10g}"
+
+
+def _enrich_ratio_median_from_features(x_features):
+    x_features = _validate_cnn_features(x_features, "xFeatures")
+    if x_features.shape[1] == 0:
+        return ""
+    non_padded = np.any(np.abs(x_features) > 0, axis=0)
+    enrich_ratios = x_features[CNN_ENRICH_RATIO_CHANNEL, non_padded]
+    if enrich_ratios.shape[0] == 0:
+        return ""
+    return _format_feature_value(np.median(enrich_ratios) * 100.0)
+
+
+def _get_entry_enrich_ratio_median(entry):
+    model_input = get_entry_model_input(entry)
+    if model_input is None:
+        return ""
+    x_features = _extract_cnn_model_features(model_input, "xFeatures")
+    return _enrich_ratio_median_from_features(x_features)
+
+
+def _insert_ms2_enrich_ratio_median_column(output_columns):
+    if MS2_ISOTOPIC_ABUNDANCE_COLUMN not in output_columns:
+        return
+    if MS2_ENRICH_RATIO_MEDIAN_COLUMN in output_columns:
+        output_columns.remove(MS2_ENRICH_RATIO_MEDIAN_COLUMN)
+    insert_idx = output_columns.index(MS2_ISOTOPIC_ABUNDANCE_COLUMN) + 1
+    output_columns.insert(insert_idx, MS2_ENRICH_RATIO_MEDIAN_COLUMN)
 
 
 class DefineDataset(Data.Dataset):
@@ -156,22 +197,47 @@ def _compute_qvalues(scores, labels):
     return qvalues
 
 
-def _predict_scores(model, model_name, feature_batches, device, batch_size, decision_threshold, model_arch):
+def _predict_scores(model, feature_batches, device, batch_size, decision_threshold):
     test_data = DefineDataset(feature_batches)
     test_loader = Data.DataLoader(test_data, batch_size=batch_size)
-    _load_model_state_dict(model, model_name, model_arch)
     model.eval()
 
     y_pred_prob = []
     y_pred = []
-    for data1 in test_loader:
-        data1 = Variable(data1).to(device)
-        output = model(data1)
-        pred_prob = torch.softmax(output.data, dim=1).cpu().numpy()
-        positive_scores = pred_prob[:, 1]
-        y_pred.extend((positive_scores >= decision_threshold).astype(int).tolist())
-        y_pred_prob.extend(positive_scores.tolist())
+    with torch.no_grad():
+        for data1 in test_loader:
+            data1 = Variable(data1).to(device)
+            output = model(data1)
+            pred_prob = torch.softmax(output.data, dim=1).cpu().numpy()
+            positive_scores = pred_prob[:, 1]
+            y_pred.extend((positive_scores >= decision_threshold).astype(int).tolist())
+            y_pred_prob.extend(positive_scores.tolist())
     return y_pred_prob, y_pred
+
+
+def _default_output_file(input_file):
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+    input_stem = os.path.splitext(os.path.basename(input_file))[0]
+    return os.path.join(input_dir, input_stem + "_SIP.tsv")
+
+
+def _is_combined_output_file(output_arg):
+    return bool(output_arg) and os.path.splitext(os.path.basename(output_arg.rstrip(os.sep)))[1].lower() in {
+        ".tsv",
+        ".txt",
+        ".csv",
+    }
+
+
+def _resolve_output_file(input_file, output_arg):
+    if not output_arg:
+        return _default_output_file(input_file)
+    if _is_combined_output_file(output_arg):
+        return output_arg
+    output_dir = output_arg
+    os.makedirs(output_dir, exist_ok=True)
+    input_stem = os.path.splitext(os.path.basename(input_file))[0]
+    return os.path.join(output_dir, input_stem + "_SIP.tsv")
 
 
 def _load_prediction_rows(input_file):
@@ -194,33 +260,52 @@ def _load_prediction_rows(input_file):
     return meta, ordered_items, feature_keys, feature_batches
 
 
-def _write_rescored_output(output_file, meta, ordered_items, score_map, predicted_label_map):
-    base_columns = list(meta.get("columns", []))
-    score_column = choose_output_column(base_columns, ["score"], "score")
-    qvalue_column = choose_output_column(base_columns, ["q-value", "qvalue"], "q-value")
-    label_column = choose_output_column(base_columns, ["Label"], "Label")
-
-    output_columns = list(base_columns)
-    for column in (score_column, qvalue_column, label_column):
-        if column not in output_columns:
-            output_columns.append(column)
-
-    labels = [predicted_label_map.get(key) for key, _ in ordered_items]
-    scores = [score_map.get(key) for key, _ in ordered_items]
-    qvalues = _compute_qvalues(scores, labels)
-    ranked_rows = []
+def _make_rescored_rows(meta, ordered_items, score_map, predicted_label_map, source_file=None):
+    labels = []
+    scores = []
+    rescored_rows = []
     for idx, (key, entry) in enumerate(ordered_items):
-        ranked_rows.append(
+        score = score_map.get(key)
+        label = predicted_label_map.get(key)
+        labels.append(label)
+        scores.append(score)
+        rescored_rows.append(
             {
-                "sort_score": float("-inf") if scores[idx] is None else float(scores[idx]),
+                "sort_score": float("-inf") if score is None else float(score),
                 "row_index": idx,
                 "key": key,
                 "entry": entry,
-                "score": scores[idx],
-                "qvalue": qvalues[idx],
-                "label": labels[idx],
+                "score": score,
+                "label": label,
+                "meta": meta,
+                "source_file": source_file,
             }
         )
+
+    qvalues = _compute_qvalues(scores, labels)
+    for row, qvalue in zip(rescored_rows, qvalues):
+        row["qvalue"] = qvalue
+    return rescored_rows
+
+
+def _get_output_columns(metas):
+    output_columns = []
+    for meta in metas:
+        for column in list(meta.get("columns", [])):
+            if column not in output_columns:
+                output_columns.append(column)
+    _insert_ms2_enrich_ratio_median_column(output_columns)
+    score_column = choose_output_column(output_columns, ["score"], "score")
+    qvalue_column = choose_output_column(output_columns, ["q-value", "qvalue"], "q-value")
+    label_column = choose_output_column(output_columns, ["Label"], "Label")
+    for column in (score_column, qvalue_column, label_column):
+        if column not in output_columns:
+            output_columns.append(column)
+    return output_columns, score_column, qvalue_column, label_column
+
+
+def _write_rescored_rows(output_file, rescored_rows, output_columns, score_column, qvalue_column, label_column):
+    ranked_rows = list(rescored_rows)
     ranked_rows.sort(key=lambda item: (-item["sort_score"], item["row_index"]))
 
     with open(output_file, "w", newline="") as fh:
@@ -229,7 +314,7 @@ def _write_rescored_output(output_file, meta, ordered_items, score_map, predicte
         for row in ranked_rows:
             key = row["key"]
             entry = row["entry"]
-            row_map = get_entry_row_map(meta, key, entry)
+            row_map = get_entry_row_map(row["meta"], key, entry)
             score = row["score"]
             if score is not None:
                 row_map[score_column] = _score_to_string(score)
@@ -241,6 +326,8 @@ def _write_rescored_output(output_file, meta, ordered_items, score_map, predicte
             label_text = format_label_value(row["label"], None)
             if label_text != "" or label_column not in row_map:
                 row_map[label_column] = label_text
+            if MS2_ENRICH_RATIO_MEDIAN_COLUMN in output_columns:
+                row_map[MS2_ENRICH_RATIO_MEDIAN_COLUMN] = _get_entry_enrich_ratio_median(entry)
             writer.writerow({column: row_map.get(column, "") for column in output_columns})
 
 
@@ -259,14 +346,14 @@ if __name__ == "__main__":
         sys.exit(1)
     if len(opts) == 0:
         print("\n\nUsage:\n")
-        print("-i\t input representation file name\n")
+        print("-i\t input representation pickle file(s), directory, glob, comma-separated, or repeated\n")
         print("-m\t Pre-trained model name\n")
-        print("-o\t Output rescored TSV file\n")
+        print("-o\t Output TSV file; for multiple inputs, a .tsv/.txt/.csv path writes one combined file, otherwise this is an output directory\n")
         print("--batch-size\t Prediction batch size (default: " + str(DEFAULT_BATCH_SIZE) + ")\n")
         print("--decision-threshold\t Predict target when p(target) >= threshold (default: best value from checkpoint)\n")
         sys.exit(1)
 
-    input_file = ""
+    input_values = []
     model_name = ""
     output_file = ""
     batch_size = DEFAULT_BATCH_SIZE
@@ -274,14 +361,14 @@ if __name__ == "__main__":
     for opt, arg in opts:
         if opt in ("-h"):
             print("\n\nUsage:\n")
-            print("-i\t input representation file name\n")
+            print("-i\t input representation pickle file(s), directory, glob, comma-separated, or repeated\n")
             print("-m\t Pre-trained model name\n")
-            print("-o\t Output rescored TSV file\n")
+            print("-o\t Output TSV file; for multiple inputs, a .tsv/.txt/.csv path writes one combined file, otherwise this is an output directory\n")
             print("--batch-size\t Prediction batch size (default: " + str(DEFAULT_BATCH_SIZE) + ")\n")
             print("--decision-threshold\t Predict target when p(target) >= threshold (default: best value from checkpoint)\n")
             sys.exit(1)
         elif opt in ("-i"):
-            input_file = arg
+            input_values.append(arg)
         elif opt in ("-m"):
             model_name = arg
         elif opt in ("-o"):
@@ -291,9 +378,11 @@ if __name__ == "__main__":
         elif opt == "--decision-threshold":
             decision_threshold = _parse_probability(arg, "--decision-threshold")
 
-    meta, ordered_items, feature_keys, feature_batches = _load_prediction_rows(input_file)
-    if len(meta.get("columns", [])) == 0:
-        raise ValueError("Input pickle does not contain the original TSV/PIN row metadata.")
+    input_files = expand_pickle_inputs(input_values)
+    if len(input_files) == 0:
+        raise ValueError("No input pickle files found. Use -i with a .pkl file, directory, glob, or comma-separated list.")
+    if len(model_name) == 0:
+        raise ValueError("Use -m to provide a CNN checkpoint.")
     checkpoint_metadata = _load_checkpoint_metadata(model_name)
     model_arch = resolve_checkpoint_model_arch(checkpoint_metadata)
     print("Using CNN model architecture from checkpoint: " + model_arch)
@@ -311,17 +400,48 @@ if __name__ == "__main__":
     model.cuda()
     model = nn.DataParallel(model)
     model.to(device)
+    _load_model_state_dict(model, model_name, model_arch)
 
-    predicted_scores, predicted_labels = _predict_scores(
-        model,
-        model_name,
-        feature_batches,
-        device,
-        batch_size,
-        decision_threshold,
-        model_arch,
-    )
-    score_map = {key: score for key, score in zip(feature_keys, predicted_scores)}
-    predicted_label_map = {key: label for key, label in zip(feature_keys, predicted_labels)}
-    _write_rescored_output(output_file, meta, ordered_items, score_map, predicted_label_map)
+    combined_output = len(input_files) > 1 and _is_combined_output_file(output_file)
+    combined_rows = []
+    combined_metas = []
+    for input_file in input_files:
+        meta, ordered_items, feature_keys, feature_batches = _load_prediction_rows(input_file)
+        if len(meta.get("columns", [])) == 0:
+            raise ValueError(f"Input pickle {input_file} does not contain the original TSV/PIN row metadata.")
+        predicted_scores, predicted_labels = _predict_scores(
+            model,
+            feature_batches,
+            device,
+            batch_size,
+            decision_threshold,
+        )
+        score_map = {key: score for key, score in zip(feature_keys, predicted_scores)}
+        predicted_label_map = {key: label for key, label in zip(feature_keys, predicted_labels)}
+        rescored_rows = _make_rescored_rows(
+            meta,
+            ordered_items,
+            score_map,
+            predicted_label_map,
+            source_file=input_file,
+        )
+        if combined_output:
+            combined_rows.extend(rescored_rows)
+            combined_metas.append(meta)
+        else:
+            output_path = _resolve_output_file(input_file, output_file)
+            output_columns, score_column, qvalue_column, label_column = _get_output_columns([meta])
+            print("Writing rescored TSV: " + output_path)
+            _write_rescored_rows(output_path, rescored_rows, output_columns, score_column, qvalue_column, label_column)
+    if combined_output:
+        labels = [row["label"] for row in combined_rows]
+        scores = [row["score"] for row in combined_rows]
+        qvalues = _compute_qvalues(scores, labels)
+        for row, qvalue in zip(combined_rows, qvalues):
+            row["qvalue"] = qvalue
+        output_columns, score_column, qvalue_column, label_column = _get_output_columns(
+            combined_metas,
+        )
+        print("Writing combined rescored TSV: " + output_file)
+        _write_rescored_rows(output_file, combined_rows, output_columns, score_column, qvalue_column, label_column)
     print("done")

@@ -49,6 +49,9 @@ def build_checkpoint_metadata(
     feature_schema=None,
     model_arch=None,
     trainable_parameter_count=None,
+    learning_rate=None,
+    class_weight=None,
+    class_weights=None,
 ):
     metadata = {
         "model_type": model_type,
@@ -64,6 +67,12 @@ def build_checkpoint_metadata(
         metadata["model_arch"] = str(model_arch)
     if trainable_parameter_count is not None:
         metadata["trainable_parameter_count"] = int(trainable_parameter_count)
+    if learning_rate is not None:
+        metadata["learning_rate"] = float(learning_rate)
+    if class_weight is not None:
+        metadata["class_weight"] = str(class_weight)
+    if class_weights is not None:
+        metadata["class_weights"] = [float(weight) for weight in class_weights]
     return metadata
 
 

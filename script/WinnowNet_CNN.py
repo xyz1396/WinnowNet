@@ -32,12 +32,16 @@ threshold=0.9
 DEFAULT_EPOCHS = 50
 DEFAULT_TRAIN_BATCH_SIZE = 1024
 DEFAULT_EVAL_BATCH_SIZE = 1024
+DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_SELECTION_MAX_FDR = 0.01
 CNN_INPUT_CHANNELS = 7
 CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
 MODEL_ARCH_TNET = "tnet"
 MODEL_ARCH_PURE_CNN = "pure_cnn"
 MODEL_ARCH_CHOICES = {MODEL_ARCH_TNET, MODEL_ARCH_PURE_CNN}
+CLASS_WEIGHT_NONE = "none"
+CLASS_WEIGHT_BALANCED = "balanced"
+CLASS_WEIGHT_CHOICES = {CLASS_WEIGHT_NONE, CLASS_WEIGHT_BALANCED}
 
 
 def _validate_model_arch(model_arch):
@@ -48,6 +52,16 @@ def _validate_model_arch(model_arch):
             f"Choose one of: {', '.join(sorted(MODEL_ARCH_CHOICES))}."
         )
     return model_arch
+
+
+def _validate_class_weight(class_weight):
+    class_weight = str(class_weight or CLASS_WEIGHT_NONE).strip().lower()
+    if class_weight not in CLASS_WEIGHT_CHOICES:
+        raise ValueError(
+            f"Unknown class weight mode {class_weight!r}. "
+            f"Choose one of: {', '.join(sorted(CLASS_WEIGHT_CHOICES))}."
+        )
+    return class_weight
 
 
 def resolve_checkpoint_model_arch(metadata):
@@ -121,6 +135,22 @@ def _load_model_state_dict(model, model_path, expected_model_arch=None):
         ) from exc
 
 
+def _prepare_output_paths(model_name):
+    if len(model_name) == 0:
+        raise ValueError("Use -m to provide an output model path.")
+
+    model_output_path = os.path.abspath(model_name)
+    output_dir = os.path.dirname(model_output_path)
+    if len(output_dir) == 0:
+        output_dir = os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+
+    model_stem = os.path.splitext(os.path.basename(model_output_path))[0] or "model"
+    checkpoint_dir = os.path.join(output_dir, model_stem + "_checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    return model_output_path, checkpoint_dir
+
+
 def _prepare_training_pool(X, yweight, dataset_name="train"):
     pos_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 1]
     neg_idx = [idx for idx, item in enumerate(yweight) if int(item[0]) == 0]
@@ -142,6 +172,17 @@ def _compute_decoy_per_target(yweight):
     return negative / float(positive)
 
 
+def _compute_class_weights(yweight):
+    target_count = sum(1 for item in yweight if int(item[0]) == 1)
+    decoy_count = sum(1 for item in yweight if int(item[0]) == 0)
+    if target_count == 0 or decoy_count == 0:
+        raise ValueError("Weighted CrossEntropyLoss requires both target and decoy samples.")
+    total_count = target_count + decoy_count
+    decoy_weight = total_count / (2.0 * decoy_count)
+    target_weight = total_count / (2.0 * target_count)
+    return [decoy_weight, target_weight], target_count, decoy_count
+
+
 def _parse_positive_int(value, flag_name):
     try:
         parsed = int(value)
@@ -149,6 +190,16 @@ def _parse_positive_int(value, flag_name):
         raise ValueError(f"{flag_name} must be a positive integer.")
     if parsed <= 0:
         raise ValueError(f"{flag_name} must be a positive integer.")
+    return parsed
+
+
+def _parse_positive_float(value, flag_name):
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ValueError(f"{flag_name} must be a positive number.")
+    if parsed <= 0:
+        raise ValueError(f"{flag_name} must be a positive number.")
     return parsed
 
 
@@ -162,7 +213,7 @@ def _build_train_loader(train_data, yweight_train, batch_size):
     print(
         f"[train] input target_count~{target_count} decoy_count~{decoy_count}"
     )
-    return Data.DataLoader(train_data, batch_size=batch_size, num_workers=8, shuffle=True, pin_memory=True)
+    return Data.DataLoader(train_data, batch_size=batch_size, num_workers=8, shuffle=True, pin_memory=True, drop_last=True)
 
 
 def _collect_prediction_scores(data, model, loss, device, eval_batch_size):
@@ -626,12 +677,16 @@ def train_model(
     model_arch,
     train_batch_size,
     eval_batch_size,
+    learning_rate,
+    class_weight,
 ):
-    LR = 1e-3
     train_data = DefineDataset(X_train, yweight_train)
     val_data = DefineDataset(X_val, yweight_val)
     test_data = DefineDataset(X_test, yweight_test)
-    os.makedirs("checkpoints", exist_ok=True)
+    model_output_path, checkpoint_dir = _prepare_output_paths(model_name)
+    checkpoint_paths = []
+    print("Model output path: " + model_output_path)
+    print("Checkpoint directory: " + checkpoint_dir)
     device = torch.device("cuda")
     model_arch = _validate_model_arch(model_arch)
     model = build_cnn_model(model_arch)
@@ -640,21 +695,35 @@ def train_model(
     print("Trainable parameters: " + str(trainable_parameter_count))
     print("Train batch size: " + str(train_batch_size))
     print("Eval batch size: " + str(eval_batch_size))
+    print("Learning rate: " + str(learning_rate))
+    class_weight = _validate_class_weight(class_weight)
+    class_weights = None
+    if class_weight == CLASS_WEIGHT_BALANCED:
+        class_weights, target_count, decoy_count = _compute_class_weights(yweight_train)
+        print(
+            "Weighted CrossEntropyLoss class weights "
+            f"[decoy={class_weights[0]:.6g}, target={class_weights[1]:.6g}] "
+            f"from train targets={target_count} decoys={decoy_count}"
+        )
+    else:
+        print("CrossEntropyLoss class weight mode: none")
     model.cuda()
     model = nn.DataParallel(model)
     model.to(device)
     if len(pretrained_model)>0:
         print("loading pretrained_model")
         _load_model_state_dict(model, pretrained_model, model_arch)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    if class_weights is None:
+        criterion = nn.CrossEntropyLoss()
+    else:
+        criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(class_weights).to(device))
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     #model.load_state_dict(
     #    torch.load('cnn_pytorch.pt', map_location=lambda storage, loc: storage))
     #test_model(model, test_data, device)
     best_loss = 10000
     print("Epochs: " + str(epochs))
     train_loader = _build_train_loader(train_data, yweight_train, train_batch_size)
-    checkpoint_paths = []
     for epoch in range(0, epochs):
         start_time = time.time()
         best_epoch_loss = 10000
@@ -691,13 +760,18 @@ def train_model(
             feature_schema=CNN_FEATURE_SCHEMA,
             model_arch=model_arch,
             trainable_parameter_count=trainable_parameter_count,
+            learning_rate=learning_rate,
+            class_weight=class_weight,
+            class_weights=class_weights,
         )
-        checkpoint_path = 'checkpoints/epoch' + str(epoch) + '.pt'
+        checkpoint_path = os.path.join(checkpoint_dir, 'epoch' + str(epoch) + '.pt')
         save_checkpoint_bundle(checkpoint_path, model.state_dict(), checkpoint_metadata)
         checkpoint_paths.append(checkpoint_path)
+        print("Saved checkpoint: " + checkpoint_path)
         if val_loss < best_loss:
             best_loss = val_loss
-            save_checkpoint_bundle(model_name, model.state_dict(), checkpoint_metadata)
+            save_checkpoint_bundle(model_output_path, model.state_dict(), checkpoint_metadata)
+            print("Saved best model: " + model_output_path)
 
         time_dif = get_time_dif(start_time)
         msg = "Epoch {0:3}, Train_loss: {1:>7.2}, Train_acc {2:>6.2%}, Train_Posprec {3:>6.2%}, Train_Negprec {" \
@@ -706,7 +780,7 @@ def train_model(
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
                          val_PosPrec, val_Negprec, best_threshold, best_target_count, best_val_fdr, time_dif))
 
-    print("Best model path: " + model_name)
+    print("Best model path: " + model_output_path)
     for checkpoint_path in checkpoint_paths:
         test_model(model, test_data, device, checkpoint_path, model_arch, eval_batch_size)
 
@@ -721,6 +795,8 @@ if __name__ == "__main__":
             "-epochs": "--epochs",
             "-train-batch-size": "--train-batch-size",
             "-eval-batch-size": "--eval-batch-size",
+            "-learning-rate": "--learning-rate",
+            "-class-weight": "--class-weight",
             "-exclude-protein-prefix": "--exclude-protein-prefix",
             "-model-arch": "--model-arch",
         },
@@ -735,6 +811,8 @@ if __name__ == "__main__":
                 "epochs=",
                 "train-batch-size=",
                 "eval-batch-size=",
+                "learning-rate=",
+                "class-weight=",
                 "exclude-protein-prefix=",
                 "model-arch=",
             ],
@@ -752,6 +830,8 @@ if __name__ == "__main__":
         print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
         print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
         print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
+        print("--learning-rate\t Adam learning rate (default: " + str(DEFAULT_LEARNING_RATE) + ")\n")
+        print("--class-weight\t CrossEntropyLoss class weighting: none or balanced (default: " + CLASS_WEIGHT_NONE + ")\n")
         print("--model-arch\t CNN architecture: tnet or pure_cnn (default: " + MODEL_ARCH_TNET + ")\n")
         print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
         sys.exit(1)
@@ -766,6 +846,8 @@ if __name__ == "__main__":
     model_arch = MODEL_ARCH_TNET
     train_batch_size = DEFAULT_TRAIN_BATCH_SIZE
     eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
+    learning_rate = DEFAULT_LEARNING_RATE
+    class_weight = CLASS_WEIGHT_NONE
     for opt, arg in opts:
         if opt in ("-h"):
             print("\n\nUsage:\n")
@@ -777,6 +859,8 @@ if __name__ == "__main__":
             print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
             print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
             print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
+            print("--learning-rate\t Adam learning rate (default: " + str(DEFAULT_LEARNING_RATE) + ")\n")
+            print("--class-weight\t CrossEntropyLoss class weighting: none or balanced (default: " + CLASS_WEIGHT_NONE + ")\n")
             print("--model-arch\t CNN architecture: tnet or pure_cnn (default: " + MODEL_ARCH_TNET + ")\n")
             print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
             sys.exit(1)
@@ -796,6 +880,10 @@ if __name__ == "__main__":
             train_batch_size = _parse_positive_int(arg, "--train-batch-size")
         elif opt == "--eval-batch-size":
             eval_batch_size = _parse_positive_int(arg, "--eval-batch-size")
+        elif opt == "--learning-rate":
+            learning_rate = _parse_positive_float(arg, "--learning-rate")
+        elif opt == "--class-weight":
+            class_weight = _validate_class_weight(arg)
         elif opt == "--model-arch":
             model_arch = _validate_model_arch(arg)
         elif opt == "--exclude-protein-prefix":
@@ -867,5 +955,7 @@ if __name__ == "__main__":
         model_arch,
         train_batch_size,
         eval_batch_size,
+        learning_rate,
+        class_weight,
     )
     print('done')
