@@ -203,6 +203,93 @@ def _parse_positive_float(value, flag_name):
     return parsed
 
 
+def _parse_nonnegative_float(value, flag_name):
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ValueError(f"{flag_name} must be a non-negative number.")
+    if parsed < 0:
+        raise ValueError(f"{flag_name} must be a non-negative number.")
+    return parsed
+
+
+def _split_csv_args(values):
+    items = []
+    for value in values:
+        for item in str(value).split(","):
+            item = item.strip()
+            if item:
+                items.append(item)
+    return items
+
+
+def _parse_ms2_exclude_values(values, flag_name):
+    return [_parse_nonnegative_float(item, flag_name) for item in _split_csv_args(values)]
+
+
+def _build_ms2_abundance_filter(threshold_value, label_kind):
+    if threshold_value is None or threshold_value <= 0:
+        return None
+    if label_kind == "target":
+        return {
+            "threshold": float(threshold_value),
+            "operator": ">",
+            "exclude_when": "le",
+        }
+    return {
+        "threshold": float(threshold_value),
+        "operator": "<",
+        "exclude_when": "ge",
+    }
+
+
+def _format_ms2_abundance_filter(ms2_abundance_filter):
+    if not ms2_abundance_filter:
+        return "none"
+    return (
+        "MS2IsotopicAbundances"
+        + ms2_abundance_filter["operator"]
+        + str(ms2_abundance_filter["threshold"])
+    )
+
+
+def _ms2_abundance_value(row_map, feature_path, record_key):
+    column_name = None
+    for column in row_map:
+        if str(column).lower() == "ms2isotopicabundances":
+            column_name = column
+            break
+    if column_name is None:
+        raise ValueError(
+            f"{feature_path}:{record_key} is missing MS2IsotopicAbundances required by exclude filter."
+        )
+    raw_value = str(row_map.get(column_name, "")).strip()
+    try:
+        return float(raw_value)
+    except ValueError:
+        raise ValueError(
+            f"{feature_path}:{record_key} has nonnumeric MS2IsotopicAbundances value {raw_value!r}."
+        )
+
+
+def _is_excluded_by_ms2_abundance(row_map, feature_path, record_key, ms2_abundance_filter):
+    if not ms2_abundance_filter:
+        return False
+    value = _ms2_abundance_value(row_map, feature_path, record_key)
+    threshold_value = ms2_abundance_filter["threshold"]
+    if ms2_abundance_filter["exclude_when"] == "lt":
+        return value < threshold_value
+    if ms2_abundance_filter["exclude_when"] == "le":
+        return value <= threshold_value
+    if ms2_abundance_filter["exclude_when"] == "gt":
+        return value > threshold_value
+    if ms2_abundance_filter["exclude_when"] == "ge":
+        return value >= threshold_value
+    raise ValueError(
+        f"Unknown MS2 abundance exclude mode {ms2_abundance_filter['exclude_when']!r}."
+    )
+
+
 def _build_train_loader(train_data, yweight_train, batch_size):
     total_samples = len(yweight_train)
     natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
@@ -272,7 +359,13 @@ def _select_best_prediction_defaults(y_true, y_scores):
     return best_threshold, best_target_count, best_fdr
 
 
-def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset", exclude_protein_prefixes=None):
+def _load_feature_records(
+    feature_paths,
+    force_label=None,
+    dataset_name="dataset",
+    exclude_protein_prefixes=None,
+    ms2_abundance_filters=None,
+):
     L = []
     Yweight = []
     groups = []
@@ -283,8 +376,11 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
     skipped_non_one = 0
     unlabeled_rows = 0
     skipped_excluded_proteins = 0
+    skipped_ms2_abundance = 0
+    ms2_abundance_filters = ms2_abundance_filters or {}
 
     for feature_path in feature_paths:
+        ms2_abundance_filter = ms2_abundance_filters.get(feature_path)
         file_positive = 0
         file_negative = 0
         file_total_rows = 0
@@ -292,6 +388,7 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
         file_skipped_non_one = 0
         file_unlabeled_rows = 0
         file_skipped_excluded_proteins = 0
+        file_skipped_ms2_abundance = 0
         file_groups = set()
         meta, entries = load_feature_pickle(feature_path)
         for record_key, entry in entries.items():
@@ -306,6 +403,15 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             if proteins_all_match_prefixes(row_map, exclude_protein_prefixes):
                 skipped_excluded_proteins += 1
                 file_skipped_excluded_proteins += 1
+                continue
+            if _is_excluded_by_ms2_abundance(
+                row_map,
+                feature_path,
+                record_key,
+                ms2_abundance_filter,
+            ):
+                skipped_ms2_abundance += 1
+                file_skipped_ms2_abundance += 1
                 continue
             group_key = get_entry_group_key(meta, psm_id, entry)
 
@@ -353,27 +459,79 @@ def _load_feature_records(feature_paths, force_label=None, dataset_name="dataset
             f"unique_groups={len(file_groups)} "
             f"total_rows={file_total_rows} unlabeled_rows={file_unlabeled_rows} "
             f"skipped_label_not_1={file_skipped_non_one} "
-            f"skipped_excluded_proteins={file_skipped_excluded_proteins}"
+            f"skipped_excluded_proteins={file_skipped_excluded_proteins} "
+            f"skipped_ms2_abundance={file_skipped_ms2_abundance} "
+            f"ms2_abundance_filter={_format_ms2_abundance_filter(ms2_abundance_filter)}"
         )
 
     print(
         f"[{dataset_name}] kept_targets={positive} kept_decoys={negative} "
         f"total_rows={total_rows} kept_rows={kept_rows} "
         f"unlabeled_rows={unlabeled_rows} skipped_label_not_1={skipped_non_one} "
-        f"skipped_excluded_proteins={skipped_excluded_proteins}"
+        f"skipped_excluded_proteins={skipped_excluded_proteins} "
+        f"skipped_ms2_abundance={skipped_ms2_abundance}"
     )
     return L, Yweight, groups
 
 
-def _resolve_training_inputs(input_directory, explicit_target, explicit_decoy):
-    target_pickles = expand_pickle_inputs(explicit_target)
-    decoy_pickles = expand_pickle_inputs(explicit_decoy)
+def _expand_pickle_inputs_with_filters(input_items, exclude_values, label_kind, flag_name):
+    if exclude_values is None:
+        thresholds = [None] * len(input_items)
+    else:
+        thresholds = _parse_ms2_exclude_values(exclude_values, flag_name)
+        if len(thresholds) != len(input_items):
+            raise ValueError(
+                f"{flag_name} has {len(thresholds)} value(s), but {label_kind} input has "
+                f"{len(input_items)} item(s). Provide exactly one threshold per input item."
+            )
+
+    paths = []
+    filters = {}
+    seen = set()
+    for input_item, threshold_value in zip(input_items, thresholds):
+        ms2_abundance_filter = _build_ms2_abundance_filter(threshold_value, label_kind)
+        for match in expand_pickle_inputs([input_item]):
+            if match in seen:
+                continue
+            seen.add(match)
+            paths.append(match)
+            if ms2_abundance_filter:
+                filters[match] = ms2_abundance_filter
+    return paths, filters
+
+
+def _resolve_training_inputs(
+    input_directory,
+    explicit_target,
+    explicit_decoy,
+    target_exclude_values=None,
+    decoy_exclude_values=None,
+):
+    target_items = _split_csv_args(explicit_target)
+    decoy_items = _split_csv_args(explicit_decoy)
+    if not target_items and not decoy_items:
+        if target_exclude_values is not None or decoy_exclude_values is not None:
+            raise ValueError("--target-exclude and --decoy-exclude can only be used with --target/--decoy split mode.")
+        return expand_pickle_inputs([input_directory]), [], False, {}, {}
+
+    target_pickles, target_filters = _expand_pickle_inputs_with_filters(
+        target_items,
+        target_exclude_values,
+        "target",
+        "--target-exclude",
+    )
+    decoy_pickles, decoy_filters = _expand_pickle_inputs_with_filters(
+        decoy_items,
+        decoy_exclude_values,
+        "decoy",
+        "--decoy-exclude",
+    )
     if target_pickles or decoy_pickles:
         if not target_pickles or not decoy_pickles:
             raise ValueError("Both -target and -decoy must be provided together.")
-        return target_pickles, decoy_pickles, True
+        return target_pickles, decoy_pickles, True, target_filters, decoy_filters
 
-    return expand_pickle_inputs([input_directory]), [], False
+    return expand_pickle_inputs([input_directory]), [], False, {}, {}
 
 
 def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
@@ -799,6 +957,8 @@ if __name__ == "__main__":
             "-class-weight": "--class-weight",
             "-exclude-protein-prefix": "--exclude-protein-prefix",
             "-model-arch": "--model-arch",
+            "-target-exclude": "--target-exclude",
+            "-decoy-exclude": "--decoy-exclude",
         },
     )
     try:
@@ -815,6 +975,8 @@ if __name__ == "__main__":
                 "class-weight=",
                 "exclude-protein-prefix=",
                 "model-arch=",
+                "target-exclude=",
+                "decoy-exclude=",
             ],
         )
     except:
@@ -827,6 +989,8 @@ if __name__ == "__main__":
         print("-p\t Optional pretrained model name\n")
         print("-target\t Target feature pickle(s), comma-separated or repeated\n")
         print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
+        print("--target-exclude\t Per-target-input MS2IsotopicAbundances strict lower bound; keep values > threshold, 0 disables\n")
+        print("--decoy-exclude\t Per-decoy-input MS2IsotopicAbundances strict upper bound; keep values < threshold, 0 disables\n")
         print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
         print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
         print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
@@ -843,6 +1007,8 @@ if __name__ == "__main__":
     exclude_protein_prefixes = []
     target_inputs = []
     decoy_inputs = []
+    target_exclude_inputs = []
+    decoy_exclude_inputs = []
     model_arch = MODEL_ARCH_TNET
     train_batch_size = DEFAULT_TRAIN_BATCH_SIZE
     eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
@@ -856,6 +1022,8 @@ if __name__ == "__main__":
             print("-p\t Optional pretrained model name\n")
             print("-target\t Target feature pickle(s), comma-separated or repeated\n")
             print("-decoy\t Decoy feature pickle(s), comma-separated or repeated\n")
+            print("--target-exclude\t Per-target-input MS2IsotopicAbundances strict lower bound; keep values > threshold, 0 disables\n")
+            print("--decoy-exclude\t Per-decoy-input MS2IsotopicAbundances strict upper bound; keep values < threshold, 0 disables\n")
             print("--epochs\t Number of training epochs (default: " + str(DEFAULT_EPOCHS) + ")\n")
             print("--train-batch-size\t Training batch size (default: " + str(DEFAULT_TRAIN_BATCH_SIZE) + ")\n")
             print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
@@ -874,6 +1042,10 @@ if __name__ == "__main__":
             target_inputs.append(arg)
         elif opt == "--decoy":
             decoy_inputs.append(arg)
+        elif opt == "--target-exclude":
+            target_exclude_inputs.append(arg)
+        elif opt == "--decoy-exclude":
+            decoy_exclude_inputs.append(arg)
         elif opt == "--epochs":
             epochs = _parse_positive_int(arg, "--epochs")
         elif opt == "--train-batch-size":
@@ -896,10 +1068,12 @@ if __name__ == "__main__":
     if not split_mode and len(input_directory) == 0:
         raise ValueError("Use -i for embedded-label training or provide both -target and -decoy.")
 
-    target_pickles, decoy_pickles, split_mode = _resolve_training_inputs(
+    target_pickles, decoy_pickles, split_mode, target_filters, decoy_filters = _resolve_training_inputs(
         input_directory,
         target_inputs,
         decoy_inputs,
+        target_exclude_inputs if target_exclude_inputs else None,
+        decoy_exclude_inputs if decoy_exclude_inputs else None,
     )
 
     if split_mode:
@@ -910,12 +1084,14 @@ if __name__ == "__main__":
             force_label=1,
             dataset_name="target",
             exclude_protein_prefixes=exclude_protein_prefixes,
+            ms2_abundance_filters=target_filters,
         )
         X_neg, y_neg, group_neg = _load_feature_records(
             decoy_pickles,
             force_label=0,
             dataset_name="decoy",
             exclude_protein_prefixes=exclude_protein_prefixes,
+            ms2_abundance_filters=decoy_filters,
         )
         X_all = X_pos + X_neg
         y_all = y_pos + y_neg
