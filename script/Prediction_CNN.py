@@ -24,8 +24,8 @@ from pkl_utils import (
 
 DEFAULT_BATCH_SIZE = 1024
 DEFAULT_DECISION_THRESHOLD = 0.5
-CNN_INPUT_CHANNELS = 7
-CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
+CNN_INPUT_CHANNELS = 10
+CNN_FEATURE_SCHEMA = "cnn_10ch_v2"
 CNN_ENRICH_RATIO_CHANNEL = 6
 MS2_ISOTOPIC_ABUNDANCE_COLUMN = "MS2IsotopicAbundances"
 MS2_ENRICH_RATIO_MEDIAN_COLUMN = "MS2isotopicAbundanceEvolopeMedian"
@@ -40,8 +40,9 @@ def _validate_cnn_features(features, label="xFeatures"):
     if x_features.shape[0] != CNN_INPUT_CHANNELS:
         raise ValueError(
             f"{label} must have {CNN_INPUT_CHANNELS} channels in the first dimension, "
-            f"got shape={x_features.shape}. Regenerate CNN features with the 7-channel "
-            "SpectraFeatures.py schema; legacy 3-channel CNN features are not supported."
+            f"got shape={x_features.shape}. Regenerate CNN features with the "
+            f"{CNN_INPUT_CHANNELS}-channel SpectraFeatures.py schema "
+            f"({CNN_FEATURE_SCHEMA}); older CNN features are not supported."
         )
     return x_features
 
@@ -49,7 +50,7 @@ def _validate_cnn_features(features, label="xFeatures"):
 def _extract_cnn_model_features(model_input, label="xFeatures"):
     if not isinstance(model_input, (list, tuple)) or len(model_input) != 1:
         raise ValueError(
-            f"{label}: CNN model_input must be [xFeatures] for the 7-channel schema."
+            f"{label}: CNN model_input must be [xFeatures] for the {CNN_INPUT_CHANNELS}-channel schema."
         )
     return _validate_cnn_features(model_input[0], label)
 
@@ -115,15 +116,15 @@ def _load_checkpoint_weights(model_path, expected_model_arch=None):
     state_dict, metadata = load_checkpoint_bundle(model_path)
     if int(metadata.get("input_channels", 0)) != CNN_INPUT_CHANNELS:
         raise ValueError(
-            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Checkpoint {model_path} is not compatible with the {CNN_INPUT_CHANNELS}-channel CNN. "
             f"Expected metadata input_channels={CNN_INPUT_CHANNELS}, got "
-            f"{metadata.get('input_channels')!r}. Old 3-channel checkpoints must be retrained."
+            f"{metadata.get('input_channels')!r}. Older CNN checkpoints must be retrained."
         )
     if metadata.get("feature_schema") != CNN_FEATURE_SCHEMA:
         raise ValueError(
-            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Checkpoint {model_path} is not compatible with the {CNN_INPUT_CHANNELS}-channel CNN. "
             f"Expected feature_schema={CNN_FEATURE_SCHEMA!r}, got "
-            f"{metadata.get('feature_schema')!r}. Old 3-channel checkpoints must be retrained."
+            f"{metadata.get('feature_schema')!r}. Older CNN checkpoints must be retrained."
         )
     checkpoint_model_arch = resolve_checkpoint_model_arch(metadata)
     if expected_model_arch is not None and checkpoint_model_arch != expected_model_arch:
@@ -141,8 +142,9 @@ def _load_model_state_dict(model, model_path, expected_model_arch=None):
         raise RuntimeError(
             f"Failed to load CNN checkpoint {model_path}. This model expects "
             f"{CNN_INPUT_CHANNELS}-channel inputs and is incompatible with old "
-            "3-channel CNN checkpoints or checkpoints from a different CNN architecture; "
-            "retrain the CNN checkpoint with regenerated 7-channel features and the requested architecture."
+            "CNN checkpoints or checkpoints from a different CNN architecture; "
+            f"retrain the CNN checkpoint with regenerated {CNN_INPUT_CHANNELS}-channel "
+            "features and the requested architecture."
         ) from exc
 
 
@@ -208,6 +210,8 @@ def _predict_scores(model, feature_batches, device, batch_size, decision_thresho
         for data1 in test_loader:
             data1 = Variable(data1).to(device)
             output = model(data1)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
             pred_prob = torch.softmax(output.data, dim=1).cpu().numpy()
             positive_scores = pred_prob[:, 1]
             y_pred.extend((positive_scores >= decision_threshold).astype(int).tolist())

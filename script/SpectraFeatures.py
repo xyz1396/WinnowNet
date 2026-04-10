@@ -11,8 +11,10 @@ import numpy as np
 from pkl_utils import PKL_META_KEY, PKL_SCHEMA_VERSION, normalize_long_flag_aliases
 
 DEFAULT_MAX_PEAKS = 128
-CNN_INPUT_CHANNELS = 7
-CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
+CNN_INPUT_CHANNELS = 10
+CNN_FEATURE_SCHEMA = "cnn_10ch_v2"
+DEFAULT_MS1_PRECURSOR_TOP_N = 5
+DEFAULT_MS2_FRAGMENT_TOP_N = 2
 NEUTRON_MASS = 1.0033548378
 pairmaxlength = DEFAULT_MAX_PEAKS
 diffPPM = 10.0
@@ -56,6 +58,8 @@ _WORKER_SCAN_MAP = None
 _WORKER_MODE = "att"
 _WORKER_MS1_WINDOW_MZ = 10.0
 _WORKER_SIP_CONFIG = None
+_WORKER_MS1_PRECURSOR_TOP_N = DEFAULT_MS1_PRECURSOR_TOP_N
+_WORKER_MS2_FRAGMENT_TOP_N = DEFAULT_MS2_FRAGMENT_TOP_N
 
 class peptide:
 
@@ -875,16 +879,18 @@ def _fragment_entries_in_exp_range(exp_peaks, Xtheory):
     ]
 
 
-def _append_cnn_matches(exp_array, theory_entries, matches, source_group):
+def _append_cnn_matches(exp_array, theory_entries, matches, source_group, top_n_to_try=1):
     if exp_array.shape[0] == 0 or len(theory_entries) == 0:
         return
+    top_n_to_try = max(1, int(_to_float(top_n_to_try, 1)))
     grouped_entries = {}
     for peak, theory_group in theory_entries:
         grouped_entries.setdefault(theory_group, []).append(peak)
 
     for theory_group, peaks in grouped_entries.items():
         peaks_by_intensity = sorted(peaks, key=lambda x: (-float(x[1]), float(x[0])))
-        for mz in peaks_by_intensity:
+        found_match = False
+        for peak_idx, mz in enumerate(peaks_by_intensity):
             theory_mz = float(mz[0])
             tolerance_mz = abs(theory_mz) * diffPPM * 1e-6
             index = np.where(
@@ -894,7 +900,10 @@ def _append_cnn_matches(exp_array, theory_entries, matches, source_group):
                 )
             )[0]
             if len(index) == 0:
-                break
+                if found_match or peak_idx + 1 >= top_n_to_try:
+                    break
+                continue
+            found_match = True
             for idx in index:
                 exp_mz = float(exp_array[idx][0])
                 matches.append(
@@ -980,17 +989,28 @@ def _normalize_cnn_matches(matches, source_maxima, group_info, ion_metadata, ion
             theory_value = theory_value / theory_max
         else:
             theory_value = 0.0
+        ion_charge = float(ion_charges.get(group_key, 1.0))
+        mono_mz = float(ion_info.get("mono_mz", 0.0))
+        isotope_index = 0.0
+        if ion_charge > 0:
+            isotope_index = float(
+                round((float(match["expmz"]) - mono_mz) * ion_charge / NEUTRON_MASS)
+            )
+        ms_level_flag = 1.0 if match["source_group"] == "precursor" else 0.0
         normalized.append(
             {
                 "raw_exp_intensity": max(0.0, float(match["raw_exp_intensity"])),
                 "features": [
                     float(match["expmz"]),
                     float(match["delta_mz"]),
-                    float(ion_info.get("mono_mz", 0.0)),
+                    mono_mz,
                     exp_value,
                     theory_value,
                     float(ion_info.get("sip_atom_number", 0.0)),
                     float(enrich_ratios.get(group_key, 0.0)),
+                    ion_charge,
+                    isotope_index,
+                    ms_level_flag,
                 ],
             }
         )
@@ -1064,6 +1084,8 @@ def IonExtract(
     scan_info,
     sip_config,
     psm_id,
+    ms1_precursor_top_n=DEFAULT_MS1_PRECURSOR_TOP_N,
+    ms2_fragment_top_n=DEFAULT_MS2_FRAGMENT_TOP_N,
 ):
     ms1_array = _to_peak_array(ms1_peaks)
     ms2_array = _to_peak_array(ms2_peaks)
@@ -1079,8 +1101,20 @@ def IonExtract(
     group_info = _build_group_info(all_theory_entries)
 
     matches = []
-    _append_cnn_matches(ms1_array, precursor_entries, matches, source_group="precursor")
-    _append_cnn_matches(ms2_array, fragment_entries, matches, source_group="fragment")
+    _append_cnn_matches(
+        ms1_array,
+        precursor_entries,
+        matches,
+        source_group="precursor",
+        top_n_to_try=ms1_precursor_top_n,
+    )
+    _append_cnn_matches(
+        ms2_array,
+        fragment_entries,
+        matches,
+        source_group="fragment",
+        top_n_to_try=ms2_fragment_top_n,
+    )
 
     if len(matches) == 0:
         xFeatures = np.asarray(pad_control_cnn([]), dtype=float)
@@ -1163,6 +1197,8 @@ def _set_worker_state(
     mode,
     ms1_window_mz,
     sip_config,
+    ms1_precursor_top_n,
+    ms2_fragment_top_n,
 ):
     global _WORKER_EXP_MS1
     global _WORKER_EXP_MS2
@@ -1172,6 +1208,8 @@ def _set_worker_state(
     global _WORKER_MODE
     global _WORKER_MS1_WINDOW_MZ
     global _WORKER_SIP_CONFIG
+    global _WORKER_MS1_PRECURSOR_TOP_N
+    global _WORKER_MS2_FRAGMENT_TOP_N
 
     _WORKER_EXP_MS1 = exp_ms1
     _WORKER_EXP_MS2 = exp_ms2
@@ -1181,6 +1219,12 @@ def _set_worker_state(
     _WORKER_MODE = mode
     _WORKER_MS1_WINDOW_MZ = ms1_window_mz
     _WORKER_SIP_CONFIG = sip_config
+    _WORKER_MS1_PRECURSOR_TOP_N = max(
+        1, int(_to_float(ms1_precursor_top_n, DEFAULT_MS1_PRECURSOR_TOP_N))
+    )
+    _WORKER_MS2_FRAGMENT_TOP_N = max(
+        1, int(_to_float(ms2_fragment_top_n, DEFAULT_MS2_FRAGMENT_TOP_N))
+    )
 
 
 def _extract_feature_for_key(key):
@@ -1213,6 +1257,8 @@ def _extract_feature_for_key(key):
             scan_info,
             _WORKER_SIP_CONFIG,
             key,
+            _WORKER_MS1_PRECURSOR_TOP_N,
+            _WORKER_MS2_FRAGMENT_TOP_N,
         )
     else:
         model_input = IonExtract_Att(
@@ -1313,6 +1359,8 @@ def print_usage():
     print("-w\t MS1 isolation window size (m/z, default 10)")
     print("-d\t m/z match tolerance in ppm (default 10)")
     print("--max-peaks\t Number of top-intensity matched peaks kept and tensor width (default " + str(DEFAULT_MAX_PEAKS) + ")")
+    print("--ms1-topn\t Search the top N precursor isotopic peaks for the first match, then continue until the next miss (default " + str(DEFAULT_MS1_PRECURSOR_TOP_N) + ")")
+    print("--ms2-topn\t Search the top N fragment isotopic peaks for the first match, then continue until the next miss (default " + str(DEFAULT_MS2_FRAGMENT_TOP_N) + ")")
     print("Required input columns: PSMId or SpecId, and Peptide.")
     print("MS2IsotopicAbundances is required unless -b/--sip-abundance is provided.")
 
@@ -1327,6 +1375,8 @@ def _run_single_conversion(
     mode,
     sip_abundance,
     ms1_isolation_window_mz,
+    ms1_precursor_top_n,
+    ms2_fragment_top_n,
 ):
     start_time = time.time()
     output_dir = os.path.dirname(os.path.abspath(output_file))
@@ -1396,6 +1446,8 @@ def _run_single_conversion(
         mode,
         ms1_isolation_window_mz,
         sip_config,
+        ms1_precursor_top_n,
+        ms2_fragment_top_n,
     )
 
     if worker_count == 1:
@@ -1421,6 +1473,8 @@ def _run_single_conversion(
                 mode,
                 ms1_isolation_window_mz,
                 sip_config,
+                ms1_precursor_top_n,
+                ms2_fragment_top_n,
             )
         with ctx.Pool(**pool_kwargs) as pool:
             for feature_key, model_input, removed_peak_count in pool.imap_unordered(
@@ -1455,6 +1509,8 @@ def _run_single_conversion(
                 "feature_schema": CNN_FEATURE_SCHEMA,
                 "input_channels": CNN_INPUT_CHANNELS,
                 "max_peaks": pairmaxlength,
+                "ms1_topn": ms1_precursor_top_n,
+                "ms2_topn": ms2_fragment_top_n,
             }
         )
     final_payload = {
@@ -1500,6 +1556,8 @@ def _build_child_command(
     ms1_isolation_window_mz,
     diff_ppm,
     max_peaks,
+    ms1_precursor_top_n,
+    ms2_fragment_top_n,
 ):
     cmd = [
         sys.executable,
@@ -1524,6 +1582,10 @@ def _build_child_command(
         str(diff_ppm),
         "--max-peaks",
         str(max_peaks),
+        "--ms1-topn",
+        str(ms1_precursor_top_n),
+        "--ms2-topn",
+        str(ms2_fragment_top_n),
     ]
     if sip_abundance:
         cmd.extend(["-b", sip_abundance])
@@ -1540,6 +1602,8 @@ def _run_batch_conversions(
     ms1_isolation_window_mz,
     diff_ppm,
     max_peaks,
+    ms1_precursor_top_n,
+    ms2_fragment_top_n,
 ):
     script_path = os.path.abspath(__file__)
     max_parallel = max(1, int(_to_float(batch_jobs, 1)))
@@ -1568,6 +1632,8 @@ def _run_batch_conversions(
                     ms1_isolation_window_mz,
                     diff_ppm,
                     max_peaks,
+                    ms1_precursor_top_n,
+                    ms2_fragment_top_n,
                 )
             )
             active.append((task, proc))
@@ -1613,6 +1679,8 @@ def main(argv=None):
             "-max-peaks": "--max-peaks",
             "-jobs": "--jobs",
             "-sip-abundance": "--sip-abundance",
+            "-ms1-topn": "--ms1-topn",
+            "-ms2-topn": "--ms2-topn",
         },
     )
     argv = _normalize_sip_abundance_args(argv)
@@ -1620,7 +1688,7 @@ def main(argv=None):
         opts, _ = getopt.getopt(
             argv,
             "hi:1:2:o:t:j:f:c:w:d:",
-            ["max-peaks=", "jobs=", "sip-abundance="],
+            ["max-peaks=", "jobs=", "sip-abundance=", "ms1-topn=", "ms2-topn="],
         )
     except Exception:
         print("Error Option, using -h for help information.")
@@ -1641,6 +1709,8 @@ def main(argv=None):
     ms1_isolation_window_mz = 10.0
     sip_abundance = ""
     pairmaxlength = DEFAULT_MAX_PEAKS
+    ms1_precursor_top_n = DEFAULT_MS1_PRECURSOR_TOP_N
+    ms2_fragment_top_n = DEFAULT_MS2_FRAGMENT_TOP_N
     for opt, arg in opts:
         if opt in ("-h"):
             print_usage()
@@ -1669,12 +1739,18 @@ def main(argv=None):
             diffPPM = max(0.0, _to_float(arg, 10.0))
         elif opt == "--max-peaks":
             pairmaxlength = max(1, int(_to_float(arg, DEFAULT_MAX_PEAKS)))
+        elif opt == "--ms1-topn":
+            ms1_precursor_top_n = max(1, int(_to_float(arg, DEFAULT_MS1_PRECURSOR_TOP_N)))
+        elif opt == "--ms2-topn":
+            ms2_fragment_top_n = max(1, int(_to_float(arg, DEFAULT_MS2_FRAGMENT_TOP_N)))
 
     if len(mode) == 0:
         mode = "att"
 
     if mode == "cnn":
         print("Max peaks kept for CNN features: " + str(pairmaxlength))
+        print("MS1 precursor top-N tries: " + str(ms1_precursor_top_n))
+        print("MS2 fragment top-N tries: " + str(ms2_fragment_top_n))
 
     if len(tsv_file) == 0:
         raise ValueError("A tab delimited PSM file is required. Use -i.")
@@ -1694,6 +1770,8 @@ def main(argv=None):
             ms1_isolation_window_mz,
             diffPPM,
             pairmaxlength,
+            ms1_precursor_top_n,
+            ms2_fragment_top_n,
         )
 
     if len(ft2_file) == 0 or len(ft1_file) == 0:
@@ -1711,6 +1789,8 @@ def main(argv=None):
         mode,
         sip_abundance,
         ms1_isolation_window_mz,
+        ms1_precursor_top_n,
+        ms2_fragment_top_n,
     )
 
 

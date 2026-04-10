@@ -12,7 +12,7 @@ except ModuleNotFoundError:
 
 
 META_KEY = "__meta__"
-DEFAULT_CNN_CHANNELS = 7
+DEFAULT_CNN_CHANNELS = 10
 
 
 def unwrap_entry(value: Any) -> Any:
@@ -162,7 +162,7 @@ def main() -> int:
         "--expected-additional-length",
         type=int,
         default=0,
-        help="Deprecated; ignored for the 7-channel CNN [xFeatures] schema.",
+        help="Deprecated; ignored for the 10-channel CNN [xFeatures] schema.",
     )
     parser.add_argument(
         "--show-errors",

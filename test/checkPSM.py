@@ -21,7 +21,7 @@ from pkl_utils import get_entry_model_input, get_entry_row_map, load_feature_pic
 PROTON_MASS = 1.00727646688
 MATCH_PPM = 10.0
 MAX_PLOT_RECORDS = 5
-CNN_INPUT_CHANNELS = 7
+CNN_INPUT_CHANNELS = 10
 CNN_EXPMZ_IDX = 0
 CNN_DELTA_MZ_IDX = 1
 CNN_MONO_MZ_IDX = 2
@@ -29,6 +29,9 @@ CNN_EXP_INTENSITY_IDX = 3
 CNN_THEORY_INTENSITY_IDX = 4
 CNN_SIP_ATOM_NUMBER_IDX = 5
 CNN_ENRICH_RATIO_IDX = 6
+CNN_ION_CHARGE_IDX = 7
+CNN_ISOTOPE_INDEX_IDX = 8
+CNN_MS_LEVEL_FLAG_IDX = 9
 PEPTIDE_COLUMNS = ["Peptide", "IdentifiedPeptide", "OriginalPeptide"]
 SCORE_COLUMNS = ["score", "Score"]
 EXPMASS_COLUMNS = ["ExpMass", "MeasuredParentMass"]
@@ -476,6 +479,9 @@ def _write_feature_tsv(records, precursor_values, output_path):
         "theoretical_intensity",
         "SIPatomNumber",
         "EnrichRatio",
+        "IonCharge",
+        "IsotopeIndex",
+        "MSLevelFlag",
     ]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -518,6 +524,9 @@ def _write_feature_tsv(records, precursor_values, output_path):
                             "theoretical_intensity": _format_tsv_value(float(feature[CNN_THEORY_INTENSITY_IDX])),
                             "SIPatomNumber": _format_tsv_value(float(feature[CNN_SIP_ATOM_NUMBER_IDX])),
                             "EnrichRatio": _format_tsv_value(float(feature[CNN_ENRICH_RATIO_IDX])),
+                            "IonCharge": _format_tsv_value(float(feature[CNN_ION_CHARGE_IDX])),
+                            "IsotopeIndex": _format_tsv_value(float(feature[CNN_ISOTOPE_INDEX_IDX])),
+                            "MSLevelFlag": _format_tsv_value(float(feature[CNN_MS_LEVEL_FLAG_IDX])),
                         }
                     )
                     writer.writerow(row)

@@ -120,8 +120,8 @@ Matching process:
 6. Stop matching lower-intensity peaks in that envelope as soon as a higher-intensity theoretical peak has no real match.
 7. Select the final top `--max-peaks` matched peaks by raw real intensity.
 
-Each match yields one 7-channel feature:
-- `[expmz, delta_mz, mono_mz, experimental_intensity, theoretical_intensity, SIPatomNumber, EnrichRatio]`
+Each match yields one 10-channel feature:
+- `[expmz, delta_mz, mono_mz, experimental_intensity, theoretical_intensity, SIPatomNumber, EnrichRatio, ion_charge, isotope_index, ms_level_flag]`
 
 Post-processing:
 - pad/truncate to `--max-peaks` (default `128`)
@@ -129,13 +129,13 @@ Post-processing:
 - normalize fragment real intensity within matched MS2 fragment peaks
 - normalize theoretical intensity within each precursor or b/y isotope envelope
 - repeat one `EnrichRatio` value across all matched peaks in the same isotope envelope
-- transpose to shape `[7, --max-peaks]`
+- transpose to shape `[10, --max-peaks]`
 
 Output entry in feature pickle (CNN path):
 - `[xFeatures]`
 
 Current CNN trainer usage (`script/WinnowNet_CNN.py`):
-- consumes `D_features[j][0]` (`xFeatures`) directly as a 7-channel tensor
+- consumes `D_features[j][0]` (`xFeatures`) directly as a 10-channel tensor
 
 ## Attention feature construction (`IonExtract_Att`)
 Used when `-f att`.

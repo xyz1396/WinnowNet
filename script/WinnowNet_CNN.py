@@ -34,8 +34,10 @@ DEFAULT_TRAIN_BATCH_SIZE = 1024
 DEFAULT_EVAL_BATCH_SIZE = 1024
 DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_SELECTION_MAX_FDR = 0.01
-CNN_INPUT_CHANNELS = 7
-CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
+DEFAULT_AUX_LOSS_WEIGHT = 0.25
+CNN_INPUT_CHANNELS = 10
+CNN_FEATURE_SCHEMA = "cnn_10ch_v2"
+CNN_ENRICH_RATIO_CHANNEL = 6
 MODEL_ARCH_TNET = "tnet"
 MODEL_ARCH_PURE_CNN = "pure_cnn"
 MODEL_ARCH_CHOICES = {MODEL_ARCH_TNET, MODEL_ARCH_PURE_CNN}
@@ -79,8 +81,9 @@ def _validate_cnn_features(features, label="xFeatures"):
     if x_features.shape[0] != CNN_INPUT_CHANNELS:
         raise ValueError(
             f"{label} must have {CNN_INPUT_CHANNELS} channels in the first dimension, "
-            f"got shape={x_features.shape}. Regenerate CNN features with the 7-channel "
-            "SpectraFeatures.py schema; legacy 3-channel CNN features are not supported."
+            f"got shape={x_features.shape}. Regenerate CNN features with the "
+            f"{CNN_INPUT_CHANNELS}-channel SpectraFeatures.py schema "
+            f"({CNN_FEATURE_SCHEMA}); older CNN features are not supported."
         )
     return x_features
 
@@ -88,9 +91,26 @@ def _validate_cnn_features(features, label="xFeatures"):
 def _extract_cnn_model_features(model_input, label="xFeatures"):
     if not isinstance(model_input, (list, tuple)) or len(model_input) != 1:
         raise ValueError(
-            f"{label}: CNN model_input must be [xFeatures] for the 7-channel schema."
+            f"{label}: CNN model_input must be [xFeatures] for the {CNN_INPUT_CHANNELS}-channel schema."
         )
     return _validate_cnn_features(model_input[0], label)
+
+
+def _cnn_non_padded_mask(x_features):
+    x_features = _validate_cnn_features(x_features, "xFeatures")
+    return np.any(np.abs(x_features) > 0, axis=0)
+
+
+def _cnn_enrich_ratio_median(x_features):
+    x_features = _validate_cnn_features(x_features, "xFeatures")
+    non_padded = _cnn_non_padded_mask(x_features)
+    enrich_ratios = x_features[CNN_ENRICH_RATIO_CHANNEL, non_padded]
+    if enrich_ratios.shape[0] == 0:
+        return None
+    enrich_ratios = enrich_ratios[np.isfinite(enrich_ratios)]
+    if enrich_ratios.shape[0] == 0:
+        return None
+    return float(np.median(enrich_ratios))
 
 
 def _label_matches_expected(entry):
@@ -104,15 +124,15 @@ def _load_checkpoint_weights(model_path, expected_model_arch=None):
     state_dict, metadata = load_checkpoint_bundle(model_path)
     if int(metadata.get("input_channels", 0)) != CNN_INPUT_CHANNELS:
         raise ValueError(
-            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Checkpoint {model_path} is not compatible with the {CNN_INPUT_CHANNELS}-channel CNN. "
             f"Expected metadata input_channels={CNN_INPUT_CHANNELS}, got "
-            f"{metadata.get('input_channels')!r}. Old 3-channel checkpoints must be retrained."
+            f"{metadata.get('input_channels')!r}. Older CNN checkpoints must be retrained."
         )
     if metadata.get("feature_schema") != CNN_FEATURE_SCHEMA:
         raise ValueError(
-            f"Checkpoint {model_path} is not compatible with the 7-channel CNN. "
+            f"Checkpoint {model_path} is not compatible with the {CNN_INPUT_CHANNELS}-channel CNN. "
             f"Expected feature_schema={CNN_FEATURE_SCHEMA!r}, got "
-            f"{metadata.get('feature_schema')!r}. Old 3-channel checkpoints must be retrained."
+            f"{metadata.get('feature_schema')!r}. Older CNN checkpoints must be retrained."
         )
     checkpoint_model_arch = resolve_checkpoint_model_arch(metadata)
     if expected_model_arch is not None and checkpoint_model_arch != _validate_model_arch(expected_model_arch):
@@ -130,8 +150,9 @@ def _load_model_state_dict(model, model_path, expected_model_arch=None):
         raise RuntimeError(
             f"Failed to load CNN checkpoint {model_path}. This model expects "
             f"{CNN_INPUT_CHANNELS}-channel inputs and is incompatible with old "
-            "3-channel CNN checkpoints or checkpoints from a different CNN architecture; "
-            "retrain the CNN checkpoint with regenerated 7-channel features and the requested architecture."
+            "CNN checkpoints or checkpoints from a different CNN architecture; "
+            f"retrain the CNN checkpoint with regenerated {CNN_INPUT_CHANNELS}-channel "
+            "features and the requested architecture."
         ) from exc
 
 
@@ -309,13 +330,22 @@ def _collect_prediction_scores(data, model, loss, device, eval_batch_size):
     total_loss = 0.0
     y_true = []
     y_scores = []
-    for data1, label, weight in data_loader:
+    for data1, label, weight, aux_target, aux_mask in data_loader:
         data1, label = Variable(data1), Variable(label)
-        data1, label = data1.to(device), label.to(device)
+        data1 = data1.to(device)
+        label = label.to(device)
+        aux_target = aux_target.to(device)
+        aux_mask = aux_mask.to(device)
         output = model(data1)
-        losses = loss(output, label)
+        losses, logits, _ = _compute_model_loss(
+            output,
+            label,
+            loss,
+            aux_target=aux_target,
+            aux_mask=aux_mask,
+        )
         total_loss += losses.data.item()
-        pred_prob = torch.softmax(output.data, dim=1)[:, 1].detach().cpu().numpy()
+        pred_prob = torch.softmax(logits.data, dim=1)[:, 1].detach().cpu().numpy()
         y_scores.extend(pred_prob.tolist())
         y_true.extend(label.data.cpu().numpy().tolist())
 
@@ -594,10 +624,15 @@ class DefineDataset(Data.Dataset):
         xFeatures = _validate_cnn_features(self.X[idx], f"sample {idx} xFeatures")
         y = self.yweight[idx][0]
         weight = self.yweight[idx][1]
+        enrich_ratio_median = _cnn_enrich_ratio_median(xFeatures)
+        aux_target = 0.0 if enrich_ratio_median is None else enrich_ratio_median
+        aux_mask = 0.0 if enrich_ratio_median is None else 1.0
 
         xFeatures = torch.FloatTensor(xFeatures)
+        aux_target = torch.tensor(aux_target, dtype=torch.float32)
+        aux_mask = torch.tensor(aux_mask, dtype=torch.float32)
 
-        return xFeatures, y, weight
+        return xFeatures, y, weight, aux_target, aux_mask
 
 
 
@@ -639,10 +674,20 @@ class T_Net(nn.Module):
         return x
 
 
+class AttentionPooling1D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.score = nn.Conv1d(channels, 1, 1)
+
+    def forward(self, x):
+        attention_logits = self.score(x).squeeze(1)
+        attention_weights = torch.softmax(attention_logits, dim=1).unsqueeze(1)
+        return torch.sum(x * attention_weights, dim=2)
+
+
 class Transform(nn.Module):
     def __init__(self):
         super().__init__()
-        self.stn = T_Net(k=CNN_INPUT_CHANNELS)
         self.fstn = T_Net(k=64)
 
         self.conv1 = nn.Conv1d(CNN_INPUT_CHANNELS, 64, 1)
@@ -654,11 +699,6 @@ class Transform(nn.Module):
         self.bn3 = nn.BatchNorm1d(1024)
 
     def forward(self, x):
-        n_pts = x.size()[2]
-        input_transform = self.stn(x)
-        x = x.transpose(2, 1)
-        x = torch.bmm(x, input_transform)
-        x = x.transpose(2, 1)
         x = F.relu(self.bn1(self.conv1(x)))
 
         trans_feat = self.fstn(x)
@@ -670,10 +710,7 @@ class Transform(nn.Module):
 
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.bn3(self.conv3(x))
-        x = torch.max(x, 2, keepdim=True)[0]
-        x = x.view(-1, 1024)
-
-        return x, input_transform, trans_feat
+        return x, trans_feat
 
 
 
@@ -681,19 +718,33 @@ class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
         self.transform = Transform()
-        self.fc1 = nn.Linear(1024, 512)
+        self.attention_pool = AttentionPooling1D(1024)
+        pooled_dim = 1024 * 3
+        self.fc1 = nn.Linear(pooled_dim, 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, 2)
+        self.aux_fc1 = nn.Linear(pooled_dim, 256)
+        self.aux_fc2 = nn.Linear(256, 1)
         self.dropout = nn.Dropout(p=0.3)
         self.bn1 = nn.BatchNorm1d(512)
         self.bn2 = nn.BatchNorm1d(256)
+        self.aux_bn1 = nn.BatchNorm1d(256)
 
     def forward(self, x):
-        x, input_transform, feature_transform = self.transform(x)
-        x = F.relu(self.bn1(self.fc1(x)))
+        x, feature_transform = self.transform(x)
+        x_max = torch.max(x, dim=2)[0]
+        x_mean = torch.mean(x, dim=2)
+        x_attn = self.attention_pool(x)
+        pooled = torch.cat([x_max, x_mean, x_attn], dim=1)
+
+        x = F.relu(self.bn1(self.fc1(pooled)))
         x = F.relu(self.bn2(self.dropout(self.fc2(x))))
         output = self.fc3(x)
-        return output
+
+        aux = F.relu(self.aux_bn1(self.aux_fc1(pooled)))
+        aux = self.dropout(aux)
+        aux = self.aux_fc2(aux).squeeze(1)
+        return output, aux
 
 
 class PureCNNNet(nn.Module):
@@ -733,6 +784,28 @@ def build_cnn_model(model_arch=MODEL_ARCH_TNET):
     return Net()
 
 
+def _extract_model_outputs(output):
+    if isinstance(output, (tuple, list)):
+        if len(output) != 2:
+            raise ValueError(f"Unexpected CNN model output structure with {len(output)} item(s).")
+        return output[0], output[1]
+    return output, None
+
+
+def _compute_model_loss(model_output, targets, criterion, aux_target=None, aux_mask=None):
+    logits, aux_prediction = _extract_model_outputs(model_output)
+    classification_loss = criterion(logits, targets)
+    auxiliary_loss = logits.new_zeros(())
+
+    if aux_prediction is not None and aux_target is not None and aux_mask is not None:
+        valid_aux_mask = aux_mask > 0.5
+        if bool(valid_aux_mask.any().item()):
+            auxiliary_loss = F.mse_loss(aux_prediction[valid_aux_mask], aux_target[valid_aux_mask])
+
+    total_loss = classification_loss + DEFAULT_AUX_LOSS_WEIGHT * auxiliary_loss
+    return total_loss, logits, auxiliary_loss
+
+
 def count_trainable_parameters(model):
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
@@ -753,15 +826,24 @@ def evaluate(data, model, loss, device, eval_batch_size):
     total_loss = 0.0
     y_true, y_pred = [], []
 
-    for data1, label, weight in data_loader:
+    for data1, label, weight, aux_target, aux_mask in data_loader:
         data1, label = Variable(data1), Variable(label)
-        data1, label = data1.to(device),label.to(device)
+        data1 = data1.to(device)
+        label = label.to(device)
+        aux_target = aux_target.to(device)
+        aux_mask = aux_mask.to(device)
 
         output = model(data1)
-        losses = loss(output, label)
+        losses, logits, _ = _compute_model_loss(
+            output,
+            label,
+            loss,
+            aux_target=aux_target,
+            aux_mask=aux_mask,
+        )
 
         total_loss += losses.data.item()
-        pred = torch.max(output.data, dim=1)[1].cpu().numpy().tolist()
+        pred = torch.max(logits.data, dim=1)[1].cpu().numpy().tolist()
         y_pred.extend(pred)
         y_true.extend(label.data.cpu().numpy().tolist())
 
@@ -794,14 +876,16 @@ def test_model(model, test_data, device, model_str, model_arch, eval_batch_size)
     _load_model_state_dict(model, model_str, model_arch)
 
     y_true, y_pred, y_pred_prob = [], [], []
-    for data1,label, weight in test_loader:
-        y_true.extend(label.data)
-        data1,label, weight = Variable(data1), Variable(label), Variable(weight)
-        data1,label, weight = data1.to(device),label.to(device), weight.to(device)
+    for data1, label, weight, aux_target, aux_mask in test_loader:
+        y_true.extend(label.data.cpu().numpy().tolist())
+        data1, label = Variable(data1), Variable(label)
+        data1 = data1.to(device)
+        label = label.to(device)
 
         output = model(data1)
-        pred = torch.max(output.data, dim=1)[1].cpu().numpy().tolist()
-        pred_prob = torch.softmax(output.data, dim=1).cpu()
+        logits, _ = _extract_model_outputs(output)
+        pred = torch.max(logits.data, dim=1)[1].cpu().numpy().tolist()
+        pred_prob = torch.softmax(logits.data, dim=1).cpu()
         pred_prob = np.asarray(pred_prob, dtype=float)
         y_pred.extend(pred)
         y_pred_prob.extend(pred_prob[:, 1].tolist())
@@ -854,6 +938,8 @@ def train_model(
     print("Train batch size: " + str(train_batch_size))
     print("Eval batch size: " + str(eval_batch_size))
     print("Learning rate: " + str(learning_rate))
+    if model_arch == MODEL_ARCH_TNET:
+        print("TNet auxiliary regression loss weight: " + str(DEFAULT_AUX_LOSS_WEIGHT))
     class_weight = _validate_class_weight(class_weight)
     class_weights = None
     if class_weight == CLASS_WEIGHT_BALANCED:
@@ -888,13 +974,22 @@ def train_model(
         # load the training data in batch
         batch_count = 0
         model.train()
-        for x1_batch, y_batch, weight in train_loader:
+        for x1_batch, y_batch, weight, aux_target, aux_mask in train_loader:
             batch_count = batch_count + 1
-            inputs, targets = Variable(x1_batch),Variable(y_batch)
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets = Variable(x1_batch), Variable(y_batch)
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            aux_target = aux_target.to(device)
+            aux_mask = aux_mask.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)  # forward computation
-            loss = criterion(outputs, targets)
+            loss, _, _ = _compute_model_loss(
+                outputs,
+                targets,
+                criterion,
+                aux_target=aux_target,
+                aux_mask=aux_mask,
+            )
             # backward propagation and update parameters
             loss.backward()
             optimizer.step()
