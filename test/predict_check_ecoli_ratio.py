@@ -36,11 +36,14 @@ class PredictionJob:
 
 DEFAULT_JOBS = [
     PredictionJob("data/spike_pct02", "data/pure_cnn_all.pt"),
+    PredictionJob("data/spike_pct02", "data/tnet_all.pt"),
     PredictionJob("data/spike_pct02b", "data/pure_cnn.pt"),
     PredictionJob("data/spike_pct05", "data/pure_cnn_all.pt"),
+    PredictionJob("data/spike_pct05", "data/tnet_all.pt"),
     PredictionJob("data/spike_pct05", "data/pure_cnn_pct5.pt"),
     PredictionJob("data/spike_pct05b", "data/pure_cnn_pct5b.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_all.pt"),
+    PredictionJob("data/spike_pct50", "data/tnet_all.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_pct50.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_pct50_5.pt"),
 ]
