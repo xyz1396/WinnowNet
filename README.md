@@ -1,188 +1,147 @@
 # WinnowNet
-This algorithm was implemented and tested on Ubuntu 20.04.6 LTS (GNU/Linux 5.15.0-84-generic, x86_64).
-## Note: 
-This repository contains the development version of WinnowNet. For the code used to reproduce the experiments in the paper, please refer to the following repository: https://github.com/Biocomputing-Research-Group/WinnowNet4Review
 
-## Overview
-WinnowNet is designed for advanced processing of mass spectrometry data with two core methods: a CNN-based approach and a self-attention-based approach. The repository includes scripts for feature extraction, model training, prediction (inference), and evaluation. A toy example is included to help users get started.
+WinnowNet is a deep-learning PSM filtering workflow for proteomic stable isotope probing data. This repository currently provides a production `pure_cnn_pct` prediction wrapper for Sipros5-style raw inputs and training utilities for the current 7-channel CNN feature schema.
 
-## Table of Contents
-- [Setup and Installation](#setup-and-installation)
-- [Requirements](#Requirements)
-- [Downloading Required Files](#download-required-files)
-- [Feature Extraction](#feature-extraction)
-- [Training](#training)
-  - [CNN-based WinnowNet](#cnn-based-winnownet)
-  - [Self-Attention-based WinnowNet](#self-attention-based-winnownet)
-- [Inference](#inference)
-  - [PSM Re-scoring](#psm-rescoring)
-- [Evaluation](#evaluation)
-- [Contact and Support](#contact-and-support)
+## Setup
 
-## Setup and installation
-### 1. Create a new conda environment and activate it.
-It is recommended to use Conda for dependency management. Run the following commands in your terminal:
-```bash
-conda create --name WinnowNet python=3.8
-conda activate WinnowNet
-```
-### 2. Install dependencies:
-CUDA version 11.8
-Pytorch GPU version is compatible with corresponding cuda version
-```bash
-pip install -r ./script/requirements.txt
-```
-## Requirements
-* **Operation system**: Linux
-* **GPU Memory**
-  * **Inference Mode**: At least 8 GB (adjust batch size if necessary)
-  * **Training Mode**: At least 20 GB
-
-## Download Required Files
-* Pre-trained model can be downloaded via:
-  * **CNN-based WinnowNet**: [cnn_pytorch.pt](https://figshare.com/articles/dataset/Models/25513531)
-  * **Self-Attention-based WinnowNet**: [marine_att.pt](https://figshare.com/articles/dataset/Models/25513531)
-* A toy example is provided in this repository.
-* **Sample Input Datasets**
-[Mass spectra data for Benchmark datasets](https://figshare.com/articles/dataset/Datasets/25511770)
-Other raw files benchmark datasets can be downloaded via:
-[PXD007587](https://www.ebi.ac.uk/pride/archive/projects/PXD007587), [PXD006118](https://www.ebi.ac.uk/pride/archive/projects/PXD006118), [PXD013386](https://www.ebi.ac.uk/pride/archive/projects/PXD006118), [PXD023217](https://www.ebi.ac.uk/pride/archive/projects/PXD023217), [PXD035759](https://www.ebi.ac.uk/pride/archive/projects/PXD035759)
-
-## Input pre-processing
-
-Extract fragment ion matching features along with 11 additional features derived from both theoretical and experimental spectra. The PSM (peptide-spectrum match) candidate information should be provided in a tab-delimited file (e.g., a TSV file output from Percolator).
-```bash
-python script/SpectraFeatures.py -i <tsv_file> -1 <ft1_file> -2 <ft2_file> -o spectra.pkl -t 48 -f cnn
-```
-* Replace `<tsv_file>` with the path to your PSM candidates file.
-* Replace `<ft1_file>` with the path to your FT1 file.
-* Replace `<ft2_file>` with the path to your FT2 file.
-* The `-t 48` option sets the number of threads (adjust this value as needed).
-* Use `-f cnn` when preparing input for the CNN-based architecture or `-f att` for the self-attention-based model.
-
-## Training WinnowNet Models
-
-This folder contains scripts, datasets, and instructions for training two variants of the WinnowNet deep learning model: a self-attention-based model and a CNN-based model. Training is carried out in two phases to enable curriculum learning from synthetic (easy) to real-world metaproteomic (difficult) datasets.
-
-## Requirements
-
-- Python 3.7+
-- PyTorch
-- NumPy, Pandas, scikit-learn
-
-### Datasets
-
-- **Prosit_train.zip** (Phase 1 training set):   https://figshare.com/articles/dataset/Datasets/25511770?file=55257041
-- **marine1_train.zip** (Phase 2 training set): https://figshare.com/articles/dataset/Datasets/25511770?file=55257035
-
----
-
-### Self-Attention-Based WinnowNet
-
-#### Phase 1: Training on Easy Tasks (Synthetic Data)
+WinnowNet is developed and tested on Linux. Create the micromamba environment used by the scripts:
 
 ```bash
-python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f att
-python script/WinnowNet_Att.py -i spectra_feature_directory -m prosit_att.pt
+micromamba create -n winnownet python=3.12 pytorch=2.5.1 numpy pandas scikit-learn einops matplotlib
+micromamba activate winnownet
 ```
 
-**Explanation of options:**
-- `-i`: Directory of `.pkl` feature files. Labels are read from each pickle, which now stores the original TSV/PIN row plus parsed `Label` / `q-value`.
-- `-1`: Corresponding FT1 file.
-- `-2`: Corresponding FT2 file (filename should match TSV).
-- `-o`: Output file to store extracted features as a `pkl` file.
-- `-t`: Number of threads for parallel processing.
-- `-f`: Feature type (`att` for self-attention model).
-- `-m`: Filename to save the trained model.
-- Optional split-mode training is also supported with `-target target.pkl[,more.pkl] -decoy decoy.pkl[,more.pkl]`; embedded labels in those pickles are ignored in that mode.
-
-#### Phase 2: Training on Difficult Tasks (Real Data)
+All examples below use:
 
 ```bash
-python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f att
-python script/WinnowNet_Att.py -i spectra_feature_directory -m marine_att.pt -p prosit_att.pt
+micromamba run -n winnownet <command>
 ```
 
-- `-p`: Pre-trained model from Phase 1.
-- A for-loop is needed to convert all `tsv` files to `pkl` files.
+## Input Files
 
-**Pre-trained model:** marine_att.pt,  https://figshare.com/articles/dataset/Models/25513531
+Use [Sipros5](https://github.com/thepanlab/Sipros5) to generate the raw WinnowNet input files:
 
----
+- `*_filtered_psms.tsv`
+- `*.FT1`
+- `*.FT2`
 
-### CNN-Based WinnowNet
+For each run, keep the files in the same directory with matching stems. For example:
 
-#### Phase 1: Training on Easy Tasks (Synthetic Data)
+```text
+sample_01_filtered_psms.tsv
+sample_01.FT1
+sample_01.FT2
+```
+
+The TSV must include PSM identifiers (`PSMId` or `SpecId`) and peptide sequences. SIP abundance columns such as `MS1IsotopicAbundances` and `MS2IsotopicAbundances` are used when present.
+
+## Prediction
+
+Run production prediction directly on the Sipros5 output directory or on a comma-separated list of `*_filtered_psms.tsv` files. `script/winnownet.py` extracts features, scores PSMs, applies the production threshold logic, and writes accepted target PSMs.
+
+The production wrapper uses 256 matched peaks per PSM.
 
 ```bash
-python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f cnn
-python script/WinnowNet_CNN.py -i spectra_feature_directory -m prosit_cnn.pt
+micromamba run -n winnownet python script/winnownet.py \
+  --target data/sample_01 \
+  --decoy data/sample_02 \
+  -o results/accepted_target_psms.tsv \
+  --decoy-output results/accepted_decoy_psms.tsv
 ```
 
-#### Phase 2: Training on Difficult Tasks (Real Data)
+In these examples, `data/sample_01` is the target sample and `data/sample_02` is the unlabeled control/decoy sample.
+
+The default model is:
+
+```text
+model/pure_cnn_all_pct.pt
+```
+
+Override it with `--model`:
 
 ```bash
-python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra_feature.pkl -t 20 -f cnn
-python script/WinnowNet_CNN.py -i spectra_feature_directory -m cnn_pytorch.pt -p prosit_cnn.pt
+micromamba run -n winnownet python script/winnownet.py \
+  --target data/sample_01 \
+  -o results/accepted_target_psms.tsv \
+  --model model/pure_cnn_all_pct.pt
 ```
 
-**Pre-trained model:** cnn_pytorch.pt, https://figshare.com/articles/dataset/Models/25513531
+Useful prediction options:
 
----
+- `--target`: Target `*_filtered_psms.tsv` file, directory, glob, or comma-separated list.
+- `--decoy`: Optional unlabeled control/decoy input. When provided, the score threshold is estimated at 1% target-decoy FDR. If no unlabeled control samples are provided, WinnowNet automatically uses the pretrained model's score-threshold calibration.
+- `--decoy-output`: Optional accepted decoy audit TSV; requires `--decoy`.
+- `--config`: SIP configuration file. Default: `script/SIP.cfg`.
+- `--sip-atom-abundance`: Optional natural isotope abundance override for no-decoy prediction, for example `C13=1.07`.
+- `--device`: `auto`, `cpu`, `cuda`, or `cuda:N`. Default: `auto`.
+- `--jobs`, `--cores`, `--threads-per-job`: Control parallel file scoring and CPU use.
+- `--batch-size`: CNN scoring batch size. Default: `1024`.
 
-### Notes
+## Training The Current CNN Model
 
-- All input FT1/FT2/TSV files must be preprocessed properly.
-- Models trained in Phase 1 are reused to initialize weights in Phase 2.
-- Training with GPU is recommended for performance.
+The current production model architecture is `pure_cnn_pct`. It expects 7-channel CNN features with schema `cnn_7ch_v1` and 256 matched peaks per PSM; old 3-channel CNN checkpoints and features are not compatible.
 
-## Inference
-### PSM Rescoring
-#### Self-Attention-Based WinnowNet
-To generate input representations for PSM candidates and perform re-scoring using the self-attention model, run:
+First generate CNN feature pickles from Sipros5 outputs. Directory/list mode automatically pairs each `*_filtered_psms.tsv` file with matching `.FT1` and `.FT2` files and writes one `.pkl` beside each TSV.
+
 ```bash
-python script/SpectraFeatures.py -i tsv_file -1 file.FT1 -2 file.FT2 -o spectra.pkl -t 48 -f att 
-python script/Prediction.py -i spectra.pkl -o rescore.out.tsv -m att_pytorch.pt  
-
+micromamba run -n winnownet python script/SpectraFeatures.py \
+  -i data/sample_01,data/sample_02 \
+  -f cnn \
+  -c script/SIP.cfg \
+  -t 8 \
+  -j 4 \
+  --max-peaks 256
 ```
-#### CNN-Based WinnowNet
-To generate input representations for PSM candidates and perform re-scoring using the CNN model, run:
+
+For a single run:
+
 ```bash
-python script/SpectraFeatures.py -i filename.tsv -1 filename.FT1 -2 filename.FT2 -o spectra.pkl -t 48 -f cnn
-python script/Prediction_CNN.py -i spectra.pkl -o rescore.out.tsv -m cnn_pytorch.pt 
-
+micromamba run -n winnownet python script/SpectraFeatures.py \
+  -i data/sample_01_filtered_psms.tsv \
+  -1 data/sample_01.FT1 \
+  -2 data/sample_01.FT2 \
+  -o data/sample_01.pkl \
+  -f cnn \
+  -c script/SIP.cfg \
+  -t 8 \
+  --max-peaks 256
 ```
-**Explanation of options:**
-- `-i`: Input feature pickle produced by `script/SpectraFeatures.py`
-- `-1`: Corresponding FT1 file.
-- `-2`: Corresponding FT2 file (filename should match TSV).
-- `-o`: Output file to store extracted features as a `pkl` file.
-- `-t`: Number of threads for parallel processing.
-- `-f`: Feature type (`att` for self-attention model, `cnn`for CNN model).
-- `-m`: Filename to save the trained model.
-- Prediction output is now a rescored TSV containing all original TSV/PIN columns plus updated `score`, `q-value`, and `Label` fields.
 
-## Evaluation
-### FDR Control at the PSM/Peptide Levels
-Filter the re-scored PSM candidates to control the false discovery rate (FDR) at both the PSM and peptide levels (targeted at 1% FDR). You will need both the original PSM file and the re-scoring results.
+Then train `pure_cnn_pct` with target and decoy feature pickles. The `--target-pct` and `--decoy-pct` values must align with the target and decoy inputs.
+
 ```bash
-python script/filtering.py -i rescore.out.txt -p tsv_file -o filtered -d Rev_ -f 0.01
+micromamba run -n winnownet python script/WinnowNet_CNN.py \
+  --target data/sample_01 \
+  --decoy data/sample_02 \
+  --target-pct 5 \
+  --decoy-pct 1 \
+  -m model/pure_cnn_all_pct.pt \
+  --model-arch pure_cnn_pct \
+  --epochs 50 \
+  --learning-rate 2e-4 \
+  --train-batch-size 1024 \
+  --eval-batch-size 1024 \
+  --class-weight none \
+  --pct-loss-weight 2.0 \
+  --exclude-protein-prefix Con_
 ```
-**Explanation of options:**
-- `-i`: Rescoring file from WinnowNet
-- `-p`: Input tab-delimited file with PSMs
-- `-o`: filtered results' prefix
-- `-d`: Decoy prefix used for target-decoy strategy. Default: Rev_
-- `-f`: False Discovery Rate. Default: 0.01
-- A for-loop is needed to convert all `tsv` files to `pkl` files.
 
-* The filtered output files include updated PSM information (new predicted scores, spectrum IDs, identified peptides, and corresponding proteins).
-* Assembling filtered identified peptides into proteins
-* This script is needed to run at the working directory inlucding filtered results at PSM and Peptide levels.
+Training writes the best model to the path passed with `-m` and per-epoch checkpoints to a sibling directory named after the model, for example `pure_cnn_all_pct_checkpoints/`.
+
+Optional filters:
+
+- `--target-exclude`: Per-target-input strict lower bound for `MS2IsotopicAbundances`; use `0` to disable for an input.
+- `--decoy-exclude`: Per-decoy-input strict upper bound for `MS2IsotopicAbundances`; use `0` to disable for an input.
+- `-p`: Load a compatible pretrained 7-channel checkpoint before training.
+
+For a grid search over `pure_cnn_pct` hyperparameters:
+
 ```bash
-python script/sipros_peptides_assembling.py
+micromamba run -n winnownet python test/grid_search_pure_cnn_pct.py
 ```
-When assembling filtered, identified peptides into proteins, the overall protein-level FDR depends on the quality of the filtered peptide list. An initial peptide-level FDR (for example, 1%) may lead to a protein-level FDR that is higher than desired. In such cases, you need to re-filter the peptides using a stricter (i.e., lower) FDR threshold until you achieve a 1% protein-level FDR. 
 
-## Contact and Support
-For further assistance, please consult the GitHub repository or reach out to the project maintainers.
+## References
+
+1. Feng, S., Zhang, B., Wang, H., Xiong, Y., Tian, A., Yuan, X., Pan, C., and Guo, X. [Enhancing peptide identification in metaproteomics through curriculum learning in deep learning](https://www.nature.com/articles/s41467-025-63977-z). *Nature Communications* 16, 8934 (2025). https://doi.org/10.1038/s41467-025-63977-z
+2. Xiong, Y., Mueller, R. S., Feng, S., Guo, X., and Pan, C. [Proteomic stable isotope probing with an upgraded Sipros algorithm for improved identification and quantification of isotopically labeled proteins](https://link.springer.com/article/10.1186/s40168-024-01866-1). *Microbiome* 12, 148 (2024). https://doi.org/10.1186/s40168-024-01866-1
+3. [Sipros5](https://github.com/thepanlab/Sipros5) is used to generate the `*_filtered_psms.tsv`, `.FT1`, and `.FT2` inputs consumed by WinnowNet.

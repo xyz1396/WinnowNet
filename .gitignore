@@ -39,7 +39,6 @@ note.md
 *~
 
 # test
-*.pt
 *.pkl
 *.txt
 *.log
@@ -53,5 +52,4 @@ data
 Thumbs.db
 
 # Model artifacts
-model/
 att_checkpoints/

@@ -25,7 +25,7 @@ import torch.utils.data as Data
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_MODEL = REPO_ROOT / "data" / "pure_cnn_all_pct.pt"
+DEFAULT_MODEL = REPO_ROOT / "model" / "pure_cnn_all_pct.pt"
 DEFAULT_CONFIG = SCRIPT_DIR / "SIP.cfg"
 DEFAULT_BATCH_SIZE = 1024
 DEFAULT_THREADS_PER_JOB = 3
