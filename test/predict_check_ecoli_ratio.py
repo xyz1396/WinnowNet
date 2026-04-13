@@ -36,13 +36,16 @@ class PredictionJob:
 
 DEFAULT_JOBS = [
     PredictionJob("data/spike_pct02", "data/pure_cnn_all.pt"),
+    PredictionJob("data/spike_pct02", "data/pure_cnn_all_pct.pt"),
     PredictionJob("data/spike_pct02", "data/tnet_all.pt"),
     PredictionJob("data/spike_pct02b", "data/pure_cnn.pt"),
     PredictionJob("data/spike_pct05", "data/pure_cnn_all.pt"),
+    PredictionJob("data/spike_pct05", "data/pure_cnn_all_pct.pt"),
     PredictionJob("data/spike_pct05", "data/tnet_all.pt"),
     PredictionJob("data/spike_pct05", "data/pure_cnn_pct5.pt"),
     PredictionJob("data/spike_pct05b", "data/pure_cnn_pct5b.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_all.pt"),
+    PredictionJob("data/spike_pct50", "data/pure_cnn_all_pct.pt"),
     PredictionJob("data/spike_pct50", "data/tnet_all.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_pct50.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_pct50_5.pt"),
@@ -72,7 +75,7 @@ def _positive_int(value):
     return parsed
 
 
-def _run_prediction_job(job, output_path, python_executable, batch_size, decision_threshold):
+def _run_prediction_job(job, output_path, python_executable, batch_size, decision_threshold, known_pct):
     command = [
         python_executable,
         str(PREDICTION_SCRIPT),
@@ -85,6 +88,8 @@ def _run_prediction_job(job, output_path, python_executable, batch_size, decisio
         "--batch-size",
         str(batch_size),
     ]
+    if known_pct is not None:
+        command.extend(["--known-pct", str(known_pct)])
     if decision_threshold is not None:
         command.extend(["--decision-threshold", str(decision_threshold)])
     subprocess.run(command, cwd=str(REPO_ROOT), check=True)
@@ -114,6 +119,7 @@ def _run_and_summarize_job(
     exclude_protein_prefixes,
 ):
     output_path = _output_path_for_job(output_dir, job)
+    known_pct = _infer_spike_in_13c_pct(job.input_path)
     print(
         f"Predicting {job.input_path} with {_checkpoint_label(job.model_path)} -> {output_path}",
         file=sys.stderr,
@@ -124,6 +130,7 @@ def _run_and_summarize_job(
         python_executable,
         batch_size,
         decision_threshold,
+        known_pct,
     )
     return _summarize_prediction_output(
         job,

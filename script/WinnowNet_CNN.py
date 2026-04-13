@@ -38,7 +38,11 @@ CNN_INPUT_CHANNELS = 7
 CNN_FEATURE_SCHEMA = "cnn_7ch_v1"
 MODEL_ARCH_TNET = "tnet"
 MODEL_ARCH_PURE_CNN = "pure_cnn"
-MODEL_ARCH_CHOICES = {MODEL_ARCH_TNET, MODEL_ARCH_PURE_CNN}
+MODEL_ARCH_PURE_CNN_PCT = "pure_cnn_pct"
+MODEL_ARCH_CHOICES = {MODEL_ARCH_TNET, MODEL_ARCH_PURE_CNN, MODEL_ARCH_PURE_CNN_PCT}
+PCT_PARAMETER_LIMIT = 100000
+DEFAULT_PCT_LOSS_WEIGHT = 0.5
+PCT_TRANSFORM_LOG1P = "log1p"
 CLASS_WEIGHT_NONE = "none"
 CLASS_WEIGHT_BALANCED = "balanced"
 CLASS_WEIGHT_CHOICES = {CLASS_WEIGHT_NONE, CLASS_WEIGHT_BALANCED}
@@ -223,6 +227,13 @@ def _split_csv_args(values):
     return items
 
 
+def _parse_pct_values(values, flag_name):
+    pct_values = []
+    for item in _split_csv_args(values):
+        pct_values.append(_parse_nonnegative_float(item, flag_name))
+    return pct_values
+
+
 def _parse_ms2_exclude_values(values, flag_name):
     return [_parse_nonnegative_float(item, flag_name) for item in _split_csv_args(values)]
 
@@ -290,7 +301,33 @@ def _is_excluded_by_ms2_abundance(row_map, feature_path, record_key, ms2_abundan
     )
 
 
-def _build_train_loader(train_data, yweight_train, batch_size):
+def _format_pct_bucket(pct_label):
+    try:
+        pct_value = float(pct_label)
+    except (TypeError, ValueError):
+        return "nan"
+    if not np.isfinite(pct_value):
+        return "nan"
+    return f"{pct_value:g}"
+
+
+def _build_pct_balanced_sampler(yweight_train):
+    bucket_counts = {}
+    sample_buckets = []
+    for item in yweight_train:
+        bucket = (int(item[0]), _format_pct_bucket(item[2] if len(item) > 2 else float("nan")))
+        sample_buckets.append(bucket)
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+    weights = [1.0 / bucket_counts[bucket] for bucket in sample_buckets]
+    bucket_summary = " ".join(
+        f"class{label}_pct{pct}={count}"
+        for (label, pct), count in sorted(bucket_counts.items(), key=lambda entry: (entry[0][0], entry[0][1]))
+    )
+    print(f"[train] pct-balanced sampler buckets: {bucket_summary}")
+    return Data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+
+def _build_train_loader(train_data, yweight_train, batch_size, model_arch=MODEL_ARCH_TNET):
     total_samples = len(yweight_train)
     natural_decoy_per_target = _compute_decoy_per_target(yweight_train)
     target_probability = 1.0 / (1.0 + natural_decoy_per_target)
@@ -300,6 +337,16 @@ def _build_train_loader(train_data, yweight_train, batch_size):
     print(
         f"[train] input target_count~{target_count} decoy_count~{decoy_count}"
     )
+    if model_arch == MODEL_ARCH_PURE_CNN_PCT:
+        sampler = _build_pct_balanced_sampler(yweight_train)
+        return Data.DataLoader(
+            train_data,
+            batch_size=batch_size,
+            num_workers=8,
+            sampler=sampler,
+            pin_memory=True,
+            drop_last=True,
+        )
     return Data.DataLoader(train_data, batch_size=batch_size, num_workers=8, shuffle=True, pin_memory=True, drop_last=True)
 
 
@@ -309,18 +356,26 @@ def _collect_prediction_scores(data, model, loss, device, eval_batch_size):
     total_loss = 0.0
     y_true = []
     y_scores = []
-    for data1, label, weight in data_loader:
+    pct_labels = []
+    for data1, label, weight, pct_label in data_loader:
         data1, label = Variable(data1), Variable(label)
         data1, label = data1.to(device), label.to(device)
         output = model(data1)
-        losses = loss(output, label)
+        logits, _ = _split_model_output(output)
+        losses = loss(logits, label)
         total_loss += losses.data.item()
-        pred_prob = torch.softmax(output.data, dim=1)[:, 1].detach().cpu().numpy()
+        pred_prob = torch.softmax(logits.data, dim=1)[:, 1].detach().cpu().numpy()
         y_scores.extend(pred_prob.tolist())
         y_true.extend(label.data.cpu().numpy().tolist())
+        pct_labels.extend(pct_label.data.cpu().numpy().tolist())
 
     data_len = max(1, len(data))
-    return total_loss / data_len, np.asarray(y_true, dtype=int), np.asarray(y_scores, dtype=float)
+    return (
+        total_loss / data_len,
+        np.asarray(y_true, dtype=int),
+        np.asarray(y_scores, dtype=float),
+        np.asarray(pct_labels, dtype=float),
+    )
 
 
 def _select_best_prediction_defaults(y_true, y_scores):
@@ -359,12 +414,82 @@ def _select_best_prediction_defaults(y_true, y_scores):
     return best_threshold, best_target_count, best_fdr
 
 
+def _select_best_prediction_pct_recall(y_true, y_scores, pct_labels):
+    if len(y_scores) == 0:
+        return 0.5, 0, 0.0, 0.0, 0.0, {}
+
+    target_mask = y_true == 1
+    pct_values = np.asarray(pct_labels, dtype=float)
+    target_pct_bins = np.unique(pct_values[target_mask & np.isfinite(pct_values)])
+    if len(target_pct_bins) == 0:
+        best_threshold, best_target_count, best_fdr = _select_best_prediction_defaults(y_true, y_scores)
+        return best_threshold, best_target_count, best_fdr, 0.0, 0.0, {}
+
+    target_totals = {
+        pct_value: int(np.sum(target_mask & (pct_values == pct_value)))
+        for pct_value in target_pct_bins
+    }
+    candidate_thresholds = np.unique(np.asarray(y_scores, dtype=float))
+    if len(candidate_thresholds) > 512:
+        quantiles = np.linspace(0.0, 1.0, 512)
+        candidate_thresholds = np.quantile(candidate_thresholds, quantiles)
+    candidate_thresholds = np.unique(
+        np.clip(np.concatenate(([1e-6, 0.5, 1.0 - 1e-6], candidate_thresholds)), 1e-6, 1.0 - 1e-6)
+    )
+
+    best_key = None
+    best_threshold = float(max(candidate_thresholds))
+    best_target_count = -1
+    best_fdr = 1.0
+    best_mean_pct_recall = 0.0
+    best_min_pct_recall = 0.0
+    for threshold_value in candidate_thresholds:
+        accepted = y_scores >= threshold_value
+        target_count = int(np.sum(target_mask & accepted))
+        decoy_count = int(np.sum((y_true == 0) & accepted))
+        current_fdr = 0.0 if target_count == 0 else decoy_count / float(target_count)
+        if current_fdr > DEFAULT_SELECTION_MAX_FDR:
+            continue
+        pct_recalls = []
+        for pct_value in target_pct_bins:
+            accepted_targets = int(np.sum(target_mask & (pct_values == pct_value) & accepted))
+            pct_recalls.append(accepted_targets / float(target_totals[pct_value]))
+        mean_pct_recall = float(np.mean(pct_recalls))
+        min_pct_recall = float(np.min(pct_recalls))
+        current_key = (mean_pct_recall, min_pct_recall, target_count, -current_fdr, float(threshold_value))
+        if best_key is None or current_key > best_key:
+            best_key = current_key
+            best_threshold = float(threshold_value)
+            best_target_count = target_count
+            best_fdr = current_fdr
+            best_mean_pct_recall = mean_pct_recall
+            best_min_pct_recall = min_pct_recall
+
+    pct_thresholds = {}
+    for pct_value in target_pct_bins:
+        bin_mask = target_mask & (pct_values == pct_value)
+        bin_eval_mask = bin_mask | (y_true == 0)
+        bin_threshold, bin_target_count, bin_fdr = _select_best_prediction_defaults(
+            y_true[bin_eval_mask],
+            y_scores[bin_eval_mask],
+        )
+        pct_thresholds[_format_pct_bucket(pct_value)] = {
+            "threshold": float(bin_threshold),
+            "targets": int(bin_target_count),
+            "fdr": float(bin_fdr),
+            "target_total": int(target_totals[pct_value]),
+        }
+
+    return best_threshold, best_target_count, best_fdr, best_mean_pct_recall, best_min_pct_recall, pct_thresholds
+
+
 def _load_feature_records(
     feature_paths,
     force_label=None,
     dataset_name="dataset",
     exclude_protein_prefixes=None,
     ms2_abundance_filters=None,
+    pct_labels_by_path=None,
 ):
     L = []
     Yweight = []
@@ -378,9 +503,11 @@ def _load_feature_records(
     skipped_excluded_proteins = 0
     skipped_ms2_abundance = 0
     ms2_abundance_filters = ms2_abundance_filters or {}
+    pct_labels_by_path = pct_labels_by_path or {}
 
     for feature_path in feature_paths:
         ms2_abundance_filter = ms2_abundance_filters.get(feature_path)
+        pct_label = pct_labels_by_path.get(feature_path)
         file_positive = 0
         file_negative = 0
         file_total_rows = 0
@@ -436,7 +563,10 @@ def _load_feature_records(
             if label == 1:
                 if confidence > threshold:
                     L.append(x_features)
-                    Yweight.append([1, 1])
+                    if pct_label is None:
+                        Yweight.append([1, 1])
+                    else:
+                        Yweight.append([1, 1, pct_label])
                     groups.append(group_key)
                     file_groups.add(group_key)
                     positive += 1
@@ -445,7 +575,10 @@ def _load_feature_records(
                     file_kept_rows += 1
             else:
                 L.append(x_features)
-                Yweight.append([0, confidence])
+                if pct_label is None:
+                    Yweight.append([0, confidence])
+                else:
+                    Yweight.append([0, confidence, pct_label])
                 groups.append(group_key)
                 file_groups.add(group_key)
                 negative += 1
@@ -474,7 +607,14 @@ def _load_feature_records(
     return L, Yweight, groups
 
 
-def _expand_pickle_inputs_with_filters(input_items, exclude_values, label_kind, flag_name):
+def _expand_pickle_inputs_with_filters(
+    input_items,
+    exclude_values,
+    label_kind,
+    flag_name,
+    pct_values=None,
+    pct_flag_name=None,
+):
     if exclude_values is None:
         thresholds = [None] * len(input_items)
     else:
@@ -484,11 +624,21 @@ def _expand_pickle_inputs_with_filters(input_items, exclude_values, label_kind, 
                 f"{flag_name} has {len(thresholds)} value(s), but {label_kind} input has "
                 f"{len(input_items)} item(s). Provide exactly one threshold per input item."
             )
+    if pct_values is None:
+        pct_labels = [None] * len(input_items)
+    else:
+        pct_labels = _parse_pct_values(pct_values, pct_flag_name)
+        if len(pct_labels) != len(input_items):
+            raise ValueError(
+                f"{pct_flag_name} has {len(pct_labels)} value(s), but {label_kind} input has "
+                f"{len(input_items)} item(s). Provide exactly one pct label per input item."
+            )
 
     paths = []
     filters = {}
+    pct_labels_by_path = {}
     seen = set()
-    for input_item, threshold_value in zip(input_items, thresholds):
+    for input_item, threshold_value, pct_label in zip(input_items, thresholds, pct_labels):
         ms2_abundance_filter = _build_ms2_abundance_filter(threshold_value, label_kind)
         for match in expand_pickle_inputs([input_item]):
             if match in seen:
@@ -497,7 +647,9 @@ def _expand_pickle_inputs_with_filters(input_items, exclude_values, label_kind, 
             paths.append(match)
             if ms2_abundance_filter:
                 filters[match] = ms2_abundance_filter
-    return paths, filters
+            if pct_label is not None:
+                pct_labels_by_path[match] = pct_label
+    return paths, filters, pct_labels_by_path
 
 
 def _resolve_training_inputs(
@@ -506,32 +658,40 @@ def _resolve_training_inputs(
     explicit_decoy,
     target_exclude_values=None,
     decoy_exclude_values=None,
+    target_pct_values=None,
+    decoy_pct_values=None,
 ):
     target_items = _split_csv_args(explicit_target)
     decoy_items = _split_csv_args(explicit_decoy)
     if not target_items and not decoy_items:
         if target_exclude_values is not None or decoy_exclude_values is not None:
             raise ValueError("--target-exclude and --decoy-exclude can only be used with --target/--decoy split mode.")
-        return expand_pickle_inputs([input_directory]), [], False, {}, {}
+        if target_pct_values is not None or decoy_pct_values is not None:
+            raise ValueError("--target-pct and --decoy-pct can only be used with --target/--decoy split mode.")
+        return expand_pickle_inputs([input_directory]), [], False, {}, {}, {}, {}
 
-    target_pickles, target_filters = _expand_pickle_inputs_with_filters(
+    target_pickles, target_filters, target_pct_labels = _expand_pickle_inputs_with_filters(
         target_items,
         target_exclude_values,
         "target",
         "--target-exclude",
+        target_pct_values,
+        "--target-pct",
     )
-    decoy_pickles, decoy_filters = _expand_pickle_inputs_with_filters(
+    decoy_pickles, decoy_filters, decoy_pct_labels = _expand_pickle_inputs_with_filters(
         decoy_items,
         decoy_exclude_values,
         "decoy",
         "--decoy-exclude",
+        decoy_pct_values,
+        "--decoy-pct",
     )
     if target_pickles or decoy_pickles:
         if not target_pickles or not decoy_pickles:
             raise ValueError("Both -target and -decoy must be provided together.")
-        return target_pickles, decoy_pickles, True, target_filters, decoy_filters
+        return target_pickles, decoy_pickles, True, target_filters, decoy_filters, target_pct_labels, decoy_pct_labels
 
-    return expand_pickle_inputs([input_directory]), [], False, {}, {}
+    return expand_pickle_inputs([input_directory]), [], False, {}, {}, {}, {}
 
 
 def split_grouped(X, Yweight, groups, val_ratio=0.1, test_ratio=0.1, seed=10):
@@ -594,10 +754,11 @@ class DefineDataset(Data.Dataset):
         xFeatures = _validate_cnn_features(self.X[idx], f"sample {idx} xFeatures")
         y = self.yweight[idx][0]
         weight = self.yweight[idx][1]
+        pct_label = self.yweight[idx][2] if len(self.yweight[idx]) > 2 else float("nan")
 
         xFeatures = torch.FloatTensor(xFeatures)
 
-        return xFeatures, y, weight
+        return xFeatures, y, weight, pct_label
 
 
 
@@ -726,15 +887,70 @@ class PureCNNNet(nn.Module):
         return self.classifier(x)
 
 
+class PureCNN_pct(nn.Module):
+    def __init__(self):
+        super(PureCNN_pct, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(CNN_INPUT_CHANNELS, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.shared = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+        )
+        self.classifier = nn.Linear(128, 2)
+        self.pct_regressor = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.features(x)
+        x_max = torch.max(x, dim=2)[0]
+        x_mean = torch.mean(x, dim=2)
+        x = torch.cat([x_max, x_mean], dim=1)
+        x = self.shared(x)
+        return self.classifier(x), self.pct_regressor(x)
+
+
 def build_cnn_model(model_arch=MODEL_ARCH_TNET):
     model_arch = _validate_model_arch(model_arch)
     if model_arch == MODEL_ARCH_PURE_CNN:
         return PureCNNNet()
+    if model_arch == MODEL_ARCH_PURE_CNN_PCT:
+        return PureCNN_pct()
     return Net()
 
 
 def count_trainable_parameters(model):
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def _split_model_output(output):
+    if isinstance(output, (tuple, list)):
+        if len(output) != 2:
+            raise ValueError(f"Expected CNN model output tuple of length 2, got {len(output)}.")
+        return output[0], output[1]
+    return output, None
+
+
+def _compute_loss(output, targets, pct_targets, class_loss, pct_loss, pct_loss_weight):
+    logits, pred_log_pct = _split_model_output(output)
+    classification_loss = class_loss(logits, targets)
+    if pct_loss is None:
+        return classification_loss
+    if pred_log_pct is None:
+        raise ValueError("Pct regression loss requires a model with a pct regression output.")
+    if torch.isnan(pct_targets).any():
+        raise ValueError("Pct regression loss requires pct labels for every batch item.")
+    expected_log_pct = torch.log1p(pct_targets.float()).view_as(pred_log_pct)
+    return classification_loss + pct_loss_weight * pct_loss(pred_log_pct, expected_log_pct)
 
 
 def get_time_dif(start_time):
@@ -743,7 +959,7 @@ def get_time_dif(start_time):
     return timedelta(seconds=int(round(time_dif)))
 
 
-def evaluate(data, model, loss, device, eval_batch_size):
+def evaluate(data, model, class_loss, device, eval_batch_size, pct_loss=None, pct_loss_weight=0.0):
     # Evaluation, return accuracy and loss
 
     model.eval()  # set mode to evaluation to disable dropout
@@ -753,15 +969,16 @@ def evaluate(data, model, loss, device, eval_batch_size):
     total_loss = 0.0
     y_true, y_pred = [], []
 
-    for data1, label, weight in data_loader:
-        data1, label = Variable(data1), Variable(label)
-        data1, label = data1.to(device),label.to(device)
+    for data1, label, weight, pct_label in data_loader:
+        data1, label, pct_label = Variable(data1), Variable(label), Variable(pct_label)
+        data1, label, pct_label = data1.to(device), label.to(device), pct_label.to(device)
 
         output = model(data1)
-        losses = loss(output, label)
+        losses = _compute_loss(output, label, pct_label, class_loss, pct_loss, pct_loss_weight)
+        logits, _ = _split_model_output(output)
 
         total_loss += losses.data.item()
-        pred = torch.max(output.data, dim=1)[1].cpu().numpy().tolist()
+        pred = torch.max(logits.data, dim=1)[1].cpu().numpy().tolist()
         y_pred.extend(pred)
         y_true.extend(label.data.cpu().numpy().tolist())
 
@@ -794,14 +1011,15 @@ def test_model(model, test_data, device, model_str, model_arch, eval_batch_size)
     _load_model_state_dict(model, model_str, model_arch)
 
     y_true, y_pred, y_pred_prob = [], [], []
-    for data1,label, weight in test_loader:
+    for data1,label, weight, pct_label in test_loader:
         y_true.extend(label.data)
         data1,label, weight = Variable(data1), Variable(label), Variable(weight)
         data1,label, weight = data1.to(device),label.to(device), weight.to(device)
 
         output = model(data1)
-        pred = torch.max(output.data, dim=1)[1].cpu().numpy().tolist()
-        pred_prob = torch.softmax(output.data, dim=1).cpu()
+        logits, _ = _split_model_output(output)
+        pred = torch.max(logits.data, dim=1)[1].cpu().numpy().tolist()
+        pred_prob = torch.softmax(logits.data, dim=1).cpu()
         pred_prob = np.asarray(pred_prob, dtype=float)
         y_pred.extend(pred)
         y_pred_prob.extend(pred_prob[:, 1].tolist())
@@ -822,6 +1040,49 @@ def test_model(model, test_data, device, model_str, model_arch, eval_batch_size)
     print("Time usage:", get_time_dif(start_time))
 
 
+def _validate_pct_training_options(
+    model_arch,
+    split_mode,
+    target_pct_inputs,
+    decoy_pct_inputs,
+    pct_loss_weight_provided,
+):
+    if model_arch == MODEL_ARCH_PURE_CNN_PCT:
+        if not split_mode:
+            raise ValueError(f"{MODEL_ARCH_PURE_CNN_PCT} requires --target/--decoy split-mode training.")
+        if not target_pct_inputs or not decoy_pct_inputs:
+            raise ValueError(f"{MODEL_ARCH_PURE_CNN_PCT} requires both --target-pct and --decoy-pct.")
+        return
+    if target_pct_inputs or decoy_pct_inputs or pct_loss_weight_provided:
+        raise ValueError(
+            "--target-pct, --decoy-pct, and --pct-loss-weight are only valid with "
+            f"--model-arch {MODEL_ARCH_PURE_CNN_PCT}."
+        )
+
+
+def _is_better_pct_checkpoint(
+    best_mean_pct_recall,
+    best_min_pct_recall,
+    best_target_count,
+    best_val_fdr,
+    val_loss,
+    current_mean_pct_recall,
+    current_min_pct_recall,
+    current_target_count,
+    current_val_fdr,
+    current_val_loss,
+):
+    if abs(best_mean_pct_recall - current_mean_pct_recall) > 1e-12:
+        return best_mean_pct_recall > current_mean_pct_recall
+    if abs(best_min_pct_recall - current_min_pct_recall) > 1e-12:
+        return best_min_pct_recall > current_min_pct_recall
+    if best_target_count != current_target_count:
+        return best_target_count > current_target_count
+    if abs(best_val_fdr - current_val_fdr) > 1e-12:
+        return best_val_fdr < current_val_fdr
+    return val_loss < current_val_loss
+
+
 def train_model(
     X_train,
     X_val,
@@ -837,6 +1098,7 @@ def train_model(
     eval_batch_size,
     learning_rate,
     class_weight,
+    pct_loss_weight,
 ):
     train_data = DefineDataset(X_train, yweight_train)
     val_data = DefineDataset(X_val, yweight_val)
@@ -849,6 +1111,11 @@ def train_model(
     model_arch = _validate_model_arch(model_arch)
     model = build_cnn_model(model_arch)
     trainable_parameter_count = count_trainable_parameters(model)
+    if model_arch == MODEL_ARCH_PURE_CNN_PCT and trainable_parameter_count >= PCT_PARAMETER_LIMIT:
+        raise ValueError(
+            f"{MODEL_ARCH_PURE_CNN_PCT} has {trainable_parameter_count} trainable parameters, "
+            f"which must be less than {PCT_PARAMETER_LIMIT}."
+        )
     print("CNN model architecture: " + model_arch)
     print("Trainable parameters: " + str(trainable_parameter_count))
     print("Train batch size: " + str(train_batch_size))
@@ -875,42 +1142,65 @@ def train_model(
         criterion = nn.CrossEntropyLoss()
     else:
         criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(class_weights).to(device))
+    pct_criterion = nn.SmoothL1Loss() if model_arch == MODEL_ARCH_PURE_CNN_PCT else None
+    if pct_criterion is not None:
+        print(
+            f"Pct regression loss: SmoothL1Loss on {PCT_TRANSFORM_LOG1P}(pct) "
+            f"with weight {pct_loss_weight}"
+        )
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     #model.load_state_dict(
     #    torch.load('cnn_pytorch.pt', map_location=lambda storage, loc: storage))
     #test_model(model, test_data, device)
     best_loss = 10000
+    best_saved_target_count = -1
+    best_saved_val_fdr = 1.0
+    best_saved_mean_pct_recall = -1.0
+    best_saved_min_pct_recall = -1.0
     print("Epochs: " + str(epochs))
-    train_loader = _build_train_loader(train_data, yweight_train, train_batch_size)
+    train_loader = _build_train_loader(train_data, yweight_train, train_batch_size, model_arch)
     for epoch in range(0, epochs):
         start_time = time.time()
         best_epoch_loss = 10000
         # load the training data in batch
         batch_count = 0
         model.train()
-        for x1_batch, y_batch, weight in train_loader:
+        for x1_batch, y_batch, weight, pct_batch in train_loader:
             batch_count = batch_count + 1
-            inputs, targets = Variable(x1_batch),Variable(y_batch)
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets, pct_targets = Variable(x1_batch), Variable(y_batch), Variable(pct_batch)
+            inputs, targets, pct_targets = inputs.to(device), targets.to(device), pct_targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)  # forward computation
-            loss = criterion(outputs, targets)
+            loss = _compute_loss(outputs, targets, pct_targets, criterion, pct_criterion, pct_loss_weight)
             # backward propagation and update parameters
             loss.backward()
             optimizer.step()
         train_acc, train_loss, train_Posprec, train_Negprec = evaluate(
-            train_data, model, criterion, device, eval_batch_size
+            train_data, model, criterion, device, eval_batch_size, pct_criterion, pct_loss_weight
         )
         val_acc, val_loss, val_PosPrec, val_Negprec = evaluate(
+            val_data, model, criterion, device, eval_batch_size, pct_criterion, pct_loss_weight
+        )
+        _, val_y_true, val_y_scores, val_pct_labels = _collect_prediction_scores(
             val_data, model, criterion, device, eval_batch_size
         )
-        _, val_y_true, val_y_scores = _collect_prediction_scores(
-            val_data, model, criterion, device, eval_batch_size
-        )
-        best_threshold, best_target_count, best_val_fdr = _select_best_prediction_defaults(
-            val_y_true,
-            val_y_scores,
-        )
+        if model_arch == MODEL_ARCH_PURE_CNN_PCT:
+            (
+                best_threshold,
+                best_target_count,
+                best_val_fdr,
+                best_mean_pct_recall,
+                best_min_pct_recall,
+                pct_decision_thresholds,
+            ) = _select_best_prediction_pct_recall(val_y_true, val_y_scores, val_pct_labels)
+        else:
+            best_threshold, best_target_count, best_val_fdr = _select_best_prediction_defaults(
+                val_y_true,
+                val_y_scores,
+            )
+            best_mean_pct_recall = float("nan")
+            best_min_pct_recall = float("nan")
+            pct_decision_thresholds = {}
         checkpoint_metadata = build_checkpoint_metadata(
             model_type="cnn",
             best_decision_threshold=best_threshold,
@@ -922,21 +1212,50 @@ def train_model(
             class_weight=class_weight,
             class_weights=class_weights,
         )
+        if model_arch == MODEL_ARCH_PURE_CNN_PCT:
+            checkpoint_metadata["pct_loss_weight"] = float(pct_loss_weight)
+            checkpoint_metadata["pct_transform"] = PCT_TRANSFORM_LOG1P
+            checkpoint_metadata["pct_balanced_sampling"] = True
+            checkpoint_metadata["pct_selection_metric"] = "mean-pct-recall"
+            checkpoint_metadata["best_mean_pct_recall"] = float(best_mean_pct_recall)
+            checkpoint_metadata["best_min_pct_recall"] = float(best_min_pct_recall)
+            checkpoint_metadata["pct_decision_thresholds"] = pct_decision_thresholds
         checkpoint_path = os.path.join(checkpoint_dir, 'epoch' + str(epoch) + '.pt')
         save_checkpoint_bundle(checkpoint_path, model.state_dict(), checkpoint_metadata)
         checkpoint_paths.append(checkpoint_path)
         print("Saved checkpoint: " + checkpoint_path)
-        if val_loss < best_loss:
+        if model_arch == MODEL_ARCH_PURE_CNN_PCT:
+            save_best_model = _is_better_pct_checkpoint(
+                best_mean_pct_recall,
+                best_min_pct_recall,
+                best_target_count,
+                best_val_fdr,
+                val_loss,
+                best_saved_mean_pct_recall,
+                best_saved_min_pct_recall,
+                best_saved_target_count,
+                best_saved_val_fdr,
+                best_loss,
+            )
+        else:
+            save_best_model = val_loss < best_loss
+        if save_best_model:
             best_loss = val_loss
+            best_saved_target_count = best_target_count
+            best_saved_val_fdr = best_val_fdr
+            best_saved_mean_pct_recall = best_mean_pct_recall
+            best_saved_min_pct_recall = best_min_pct_recall
             save_checkpoint_bundle(model_output_path, model.state_dict(), checkpoint_metadata)
             print("Saved best model: " + model_output_path)
 
         time_dif = get_time_dif(start_time)
         msg = "Epoch {0:3}, Train_loss: {1:>7.2}, Train_acc {2:>6.2%}, Train_Posprec {3:>6.2%}, Train_Negprec {" \
               "4:>6.2%}, " + "Val_loss: {5:>6.2}, Val_acc {6:>6.2%},Val_Posprec {7:6.2%}, Val_Negprec {8:6.2%}, " \
-              "BestThreshold {9:.4f}, BestTargets@FDR<=1% {10}, BestValFDR {11:.4%} Time: {12} "
+              "BestThreshold {9:.4f}, BestTargets@FDR<=1% {10}, BestValFDR {11:.4%}, " \
+              "BestMeanPctRecall {12:.4%}, BestMinPctRecall {13:.4%} Time: {14} "
         print(msg.format(epoch + 1, train_loss, train_acc, train_Posprec, train_Negprec, val_loss, val_acc,
-                         val_PosPrec, val_Negprec, best_threshold, best_target_count, best_val_fdr, time_dif))
+                         val_PosPrec, val_Negprec, best_threshold, best_target_count, best_val_fdr,
+                         best_mean_pct_recall, best_min_pct_recall, time_dif))
 
     print("Best model path: " + model_output_path)
     for checkpoint_path in checkpoint_paths:
@@ -959,6 +1278,9 @@ if __name__ == "__main__":
             "-model-arch": "--model-arch",
             "-target-exclude": "--target-exclude",
             "-decoy-exclude": "--decoy-exclude",
+            "-target-pct": "--target-pct",
+            "-decoy-pct": "--decoy-pct",
+            "-pct-loss-weight": "--pct-loss-weight",
         },
     )
     try:
@@ -977,6 +1299,9 @@ if __name__ == "__main__":
                 "model-arch=",
                 "target-exclude=",
                 "decoy-exclude=",
+                "target-pct=",
+                "decoy-pct=",
+                "pct-loss-weight=",
             ],
         )
     except:
@@ -996,7 +1321,10 @@ if __name__ == "__main__":
         print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
         print("--learning-rate\t Adam learning rate (default: " + str(DEFAULT_LEARNING_RATE) + ")\n")
         print("--class-weight\t CrossEntropyLoss class weighting: none or balanced (default: " + CLASS_WEIGHT_NONE + ")\n")
-        print("--model-arch\t CNN architecture: tnet or pure_cnn (default: " + MODEL_ARCH_TNET + ")\n")
+        print("--model-arch\t CNN architecture: tnet, pure_cnn, or pure_cnn_pct (default: " + MODEL_ARCH_TNET + ")\n")
+        print("--target-pct\t Per-target-input 13C pct label for pure_cnn_pct, comma-separated or repeated\n")
+        print("--decoy-pct\t Per-decoy-input 13C pct label for pure_cnn_pct, comma-separated or repeated\n")
+        print("--pct-loss-weight\t Weight for pure_cnn_pct SmoothL1 log1p(pct) loss (default: " + str(DEFAULT_PCT_LOSS_WEIGHT) + ")\n")
         print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
         sys.exit(1)
         start_time=time.time()
@@ -1009,11 +1337,15 @@ if __name__ == "__main__":
     decoy_inputs = []
     target_exclude_inputs = []
     decoy_exclude_inputs = []
+    target_pct_inputs = []
+    decoy_pct_inputs = []
     model_arch = MODEL_ARCH_TNET
     train_batch_size = DEFAULT_TRAIN_BATCH_SIZE
     eval_batch_size = DEFAULT_EVAL_BATCH_SIZE
     learning_rate = DEFAULT_LEARNING_RATE
     class_weight = CLASS_WEIGHT_NONE
+    pct_loss_weight = DEFAULT_PCT_LOSS_WEIGHT
+    pct_loss_weight_provided = False
     for opt, arg in opts:
         if opt in ("-h"):
             print("\n\nUsage:\n")
@@ -1029,7 +1361,10 @@ if __name__ == "__main__":
             print("--eval-batch-size\t Validation/test batch size (default: " + str(DEFAULT_EVAL_BATCH_SIZE) + ")\n")
             print("--learning-rate\t Adam learning rate (default: " + str(DEFAULT_LEARNING_RATE) + ")\n")
             print("--class-weight\t CrossEntropyLoss class weighting: none or balanced (default: " + CLASS_WEIGHT_NONE + ")\n")
-            print("--model-arch\t CNN architecture: tnet or pure_cnn (default: " + MODEL_ARCH_TNET + ")\n")
+            print("--model-arch\t CNN architecture: tnet, pure_cnn, or pure_cnn_pct (default: " + MODEL_ARCH_TNET + ")\n")
+            print("--target-pct\t Per-target-input 13C pct label for pure_cnn_pct, comma-separated or repeated\n")
+            print("--decoy-pct\t Per-decoy-input 13C pct label for pure_cnn_pct, comma-separated or repeated\n")
+            print("--pct-loss-weight\t Weight for pure_cnn_pct SmoothL1 log1p(pct) loss (default: " + str(DEFAULT_PCT_LOSS_WEIGHT) + ")\n")
             print("--exclude-protein-prefix\t Drop PSMs when all proteins start with one of the given prefixes, comma-separated (for example Con_)\n")
             sys.exit(1)
         elif opt in ("-i"):
@@ -1046,6 +1381,13 @@ if __name__ == "__main__":
             target_exclude_inputs.append(arg)
         elif opt == "--decoy-exclude":
             decoy_exclude_inputs.append(arg)
+        elif opt == "--target-pct":
+            target_pct_inputs.append(arg)
+        elif opt == "--decoy-pct":
+            decoy_pct_inputs.append(arg)
+        elif opt == "--pct-loss-weight":
+            pct_loss_weight = _parse_nonnegative_float(arg, "--pct-loss-weight")
+            pct_loss_weight_provided = True
         elif opt == "--epochs":
             epochs = _parse_positive_int(arg, "--epochs")
         elif opt == "--train-batch-size":
@@ -1067,13 +1409,30 @@ if __name__ == "__main__":
     split_mode = bool(target_inputs or decoy_inputs)
     if not split_mode and len(input_directory) == 0:
         raise ValueError("Use -i for embedded-label training or provide both -target and -decoy.")
+    _validate_pct_training_options(
+        model_arch,
+        split_mode,
+        target_pct_inputs,
+        decoy_pct_inputs,
+        pct_loss_weight_provided,
+    )
 
-    target_pickles, decoy_pickles, split_mode, target_filters, decoy_filters = _resolve_training_inputs(
+    (
+        target_pickles,
+        decoy_pickles,
+        split_mode,
+        target_filters,
+        decoy_filters,
+        target_pct_labels,
+        decoy_pct_labels,
+    ) = _resolve_training_inputs(
         input_directory,
         target_inputs,
         decoy_inputs,
         target_exclude_inputs if target_exclude_inputs else None,
         decoy_exclude_inputs if decoy_exclude_inputs else None,
+        target_pct_inputs if target_pct_inputs else None,
+        decoy_pct_inputs if decoy_pct_inputs else None,
     )
 
     if split_mode:
@@ -1085,6 +1444,7 @@ if __name__ == "__main__":
             dataset_name="target",
             exclude_protein_prefixes=exclude_protein_prefixes,
             ms2_abundance_filters=target_filters,
+            pct_labels_by_path=target_pct_labels,
         )
         X_neg, y_neg, group_neg = _load_feature_records(
             decoy_pickles,
@@ -1092,6 +1452,7 @@ if __name__ == "__main__":
             dataset_name="decoy",
             exclude_protein_prefixes=exclude_protein_prefixes,
             ms2_abundance_filters=decoy_filters,
+            pct_labels_by_path=decoy_pct_labels,
         )
         X_all = X_pos + X_neg
         y_all = y_pos + y_neg
@@ -1133,5 +1494,6 @@ if __name__ == "__main__":
         eval_batch_size,
         learning_rate,
         class_weight,
+        pct_loss_weight,
     )
     print('done')
