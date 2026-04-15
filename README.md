@@ -1,6 +1,10 @@
 # WinnowNet
 
-WinnowNet is a deep-learning PSM filtering workflow for proteomic stable isotope probing data. This repository currently provides a production `pure_cnn_pct` prediction wrapper for Sipros5-style raw inputs and training utilities for the current 7-channel CNN feature schema.
+<p align="center">
+  <img src="script/WinnowNetlogo.png" alt="WinnowNet logo" width="240">
+</p>
+
+This is the proteomic SIP branch of WinnowNet, a deep-learning PSM filtering workflow for proteomic stable isotope probing data. This repository currently provides a production `pure_cnn_pct` prediction wrapper for Sipros5-style raw inputs and training utilities for the current 7-channel CNN feature schema.
 
 ## Setup
 
