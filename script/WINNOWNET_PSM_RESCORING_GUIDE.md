@@ -150,8 +150,9 @@ Feature construction:
 - trims theoretical fragment peaks to the observed MS2 m/z range
 - matches MS2 peaks to trimmed theoretical fragment peaks
 - preserves precursor and b/y isotope-envelope metadata
-- ranks final matched peaks by raw experimental intensity
-- pads or truncates to 256 matched peaks for the production model
+- selects the top 256 matched peaks by raw experimental intensity
+- sorts the retained matched peaks by experimental m/z (`expmz`) before tensor output
+- pads with zero-valued peak rows if fewer than 256 matched peaks are retained
 - normalizes real and theoretical intensities by precursor, fragment, or isotope-envelope grouping
 - repeats one `EnrichRatio` value across all matched peaks in the same isotope envelope
 
@@ -164,6 +165,9 @@ Input:
 ```text
 [batch, 7, 256]
 ```
+
+The 256 peak positions are the retained top-intensity matched peaks in increasing `expmz` order.
+Therefore, local `Conv1d(kernel_size=3)` neighborhoods are neighboring retained peaks by experimental m/z.
 
 Convolutional feature extractor:
 
