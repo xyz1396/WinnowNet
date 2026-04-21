@@ -32,6 +32,7 @@ OUTPUT_COLUMNS = SUMMARY_ID_COLUMNS + SUMMARY_COLUMNS
 class PredictionJob:
     input_path: str
     model_path: str
+    known_pct: float = None
 
 
 DEFAULT_JOBS = [
@@ -49,6 +50,9 @@ DEFAULT_JOBS = [
     PredictionJob("data/spike_pct50", "data/tnet_all.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_pct50.pt"),
     PredictionJob("data/spike_pct50", "data/pure_cnn_pct50_5.pt"),
+    PredictionJob("data/spike_control", "data/pure_cnn_all_pct.pt", 2),
+    PredictionJob("data/spike_control", "data/pure_cnn_all_pct.pt", 5),
+    PredictionJob("data/spike_control", "data/pure_cnn_all_pct.pt", 50),
 ]
 DEFAULT_PARALLEL_JOBS = 8
 
@@ -62,8 +66,25 @@ def _safe_stem(value):
     return "".join(char if char.isalnum() or char in "._-" else "_" for char in text)
 
 
+def _format_pct_label(value):
+    pct_value = float(value)
+    if pct_value.is_integer():
+        pct_text = f"{int(pct_value):02d}"
+    else:
+        pct_text = f"{pct_value:g}".replace(".", "p")
+    return f"pct{pct_text}"
+
+
+def _job_known_pct(job):
+    if job.known_pct is not None:
+        return job.known_pct
+    return _infer_spike_in_13c_pct(job.input_path)
+
+
 def _output_path_for_job(output_dir, job):
     input_label = _safe_stem(job.input_path)
+    if job.known_pct is not None:
+        input_label = f"{input_label}_{_format_pct_label(job.known_pct)}"
     model_label = _safe_stem(_checkpoint_label(job.model_path))
     return output_dir / f"{input_label}__{model_label}.tsv"
 
@@ -104,7 +125,7 @@ def _summarize_prediction_output(job, output_path, qvalue_threshold, include_all
     )
     summary["Input"] = job.input_path
     summary["Model"] = _checkpoint_label(job.model_path)
-    summary["Spike-in 13C (%)"] = _infer_spike_in_13c_pct(job.input_path)
+    summary["Spike-in 13C (%)"] = _job_known_pct(job)
     return summary
 
 
@@ -119,7 +140,7 @@ def _run_and_summarize_job(
     exclude_protein_prefixes,
 ):
     output_path = _output_path_for_job(output_dir, job)
-    known_pct = _infer_spike_in_13c_pct(job.input_path)
+    known_pct = _job_known_pct(job)
     print(
         f"Predicting {job.input_path} with {_checkpoint_label(job.model_path)} -> {output_path}",
         file=sys.stderr,
